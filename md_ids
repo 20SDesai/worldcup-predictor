@@ -798,8 +798,9 @@ def _render_prediction_form(user, match, round_ids):
         )
 
     booster_already_used = booster_used_this_round(
-        user["id"], matchday_ids, exclude_match_id=match_id
+        user["id"], round_ids, exclude_match_id=match_id
     )
+
     current_boost = bool(saved and saved["booster_used"])
     if booster_already_used and not current_boost:
         st.caption("⚡ 2x booster already used this matchday.")
