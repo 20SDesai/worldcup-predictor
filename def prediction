@@ -712,6 +712,9 @@ def leaderboard_page():
 # ─────────────────────────────────────────────
 # UI — PREDICTIONS
 # ─────────────────────────────────────────────
+# ─────────────────────────────────────────────
+# UI — PREDICTIONS
+# ─────────────────────────────────────────────
 def predictions_page(user: dict, matches: list):
     st.header("📋 Your predictions")
 
@@ -730,10 +733,11 @@ def predictions_page(user: dict, matches: list):
             round_name = m.get("round_name", "")
 
             if "Round" in round_name:
-                label = round_name  # e.g. "Round 1", "Round of 16"
+                # e.g. "Round 1", "Round 2", "Round of 32", "Round of 16"
+                label = round_name
             else:
+                # Fallback to original matchday/group label
                 label = m.get("matchday", "Unknown Round")
-
 
             matchday_groups.setdefault(label, []).append(m)
 
@@ -743,27 +747,24 @@ def predictions_page(user: dict, matches: list):
                 for match in md_matches:
                     _render_prediction_form(user, match, round_ids)
 
-
     if live_finished:
         st.subheader("Live & finished matches")
         for match in live_finished[-10:]:
             _render_locked_match(user, match)
 
+
 def _render_prediction_form(user, match, round_ids):
-    match_id  = match["id"]
-    # Extract matchday number from SofaScore round name
+    match_id = match["id"]
+
+    # SofaScore round name, e.g. "Round 1", "Round of 16", "Quarter-finals"
     round_name = match.get("round_name", "")
-    try:
-        matchday_number = int(round_name.split()[-1])  # "Round 1" → 1
-    except:
-        matchday_number = 1
 
     home_team = match["home_team"]
     away_team = match["away_team"]
-    kickoff   = parse_kickoff(match["date"])
-    locked    = is_locked(kickoff)
-    is_ko     = match["stage"] not in ("group", "group stage", "GROUP_STAGE", "")
-    saved     = get_prediction(user["id"], match_id)
+    kickoff = parse_kickoff(match["date"])
+    locked = is_locked(kickoff)
+    is_ko = match["stage"] not in ("group", "group stage", "GROUP_STAGE", "")
+    saved = get_prediction(user["id"], match_id)
 
     st.markdown(f"**{home_team} vs {away_team}**")
     st.caption(f"🕐 {display_time(kickoff)}")
@@ -784,38 +785,42 @@ def _render_prediction_form(user, match, round_ids):
     with c1:
         st.write(home_team)
         home_g = st.number_input(
-            "Home goals", min_value=0, max_value=20,
+            "Home goals",
+            min_value=0,
+            max_value=20,
             value=int(saved["home_goals"]) if saved and saved["home_goals"] is not None else 0,
-            key=f"h_{match_id}"
+            key=f"h_{match_id}",
         )
     with c2:
         st.markdown("<br><br>**–**", unsafe_allow_html=True)
     with c3:
         st.write(away_team)
         away_g = st.number_input(
-            "Away goals", min_value=0, max_value=20,
+            "Away goals",
+            min_value=0,
+            max_value=20,
             value=int(saved["away_goals"]) if saved and saved["away_goals"] is not None else 0,
-            key=f"a_{match_id}"
+            key=f"a_{match_id}",
         )
 
+    # One booster per round (Round 1, Round 2, Round of 32, etc.)
     booster_already_used = booster_used_this_round(
         user["id"], round_ids, exclude_match_id=match_id
     )
 
     current_boost = bool(saved and saved["booster_used"])
     if booster_already_used and not current_boost:
-        st.caption("⚡ 2x booster already used this matchday.")
+        st.caption("⚡ 2x booster already used in this round.")
         booster = False
     else:
         booster = st.checkbox(
-            f"⚡ Use Booster for {round_name}",
+            f"⚡ Use Booster for {round_name or 'this round'}",
             value=current_boost,
-            key=f"b_{match_id}"
+            key=f"b_{match_id}",
         )
 
-
     first_scorer = None
-    first_team   = None
+    first_team = None
     if is_ko:
         st.caption("Knockout match — extra points for first scorer & first team.")
 
@@ -827,22 +832,28 @@ def _render_prediction_form(user, match, round_ids):
             "First goalscorer (optional)",
             options=combined_squad,
             index=combined_squad.index(saved["first_scorer"])
-                  if saved and saved["first_scorer"] in combined_squad else 0,
-            key=f"fs_{match_id}"
+            if saved and saved["first_scorer"] in combined_squad
+            else 0,
+            key=f"fs_{match_id}",
         )
 
         first_team = st.selectbox(
             "Team to score first (optional)",
             options=["", home_team, away_team],
-            index=(["", home_team, away_team].index(saved["first_team"])
-                   if saved and saved["first_team"] in ["", home_team, away_team] else 0),
-            key=f"ft_{match_id}"
+            index=(
+                ["", home_team, away_team].index(saved["first_team"])
+                if saved and saved["first_team"] in ["", home_team, away_team]
+                else 0
+            ),
+            key=f"ft_{match_id}",
         )
 
     if st.button("Save prediction", key=f"save_{match_id}"):
         save_prediction(
-            user["id"], match_id,
-            int(home_g), int(away_g),
+            user["id"],
+            match_id,
+            int(home_g),
+            int(away_g),
             booster_used=booster,
             first_scorer=first_scorer or None,
             first_team=first_team or None,
@@ -852,12 +863,13 @@ def _render_prediction_form(user, match, round_ids):
 
     st.divider()
 
+
 def _render_locked_match(user: dict, match: dict):
-    match_id  = match["id"]
+    match_id = match["id"]
     home_team = match["home_team"]
     away_team = match["away_team"]
-    kickoff   = parse_kickoff(match["date"])
-    saved     = get_prediction(user["id"], match_id)
+    kickoff = parse_kickoff(match["date"])
+    saved = get_prediction(user["id"], match_id)
 
     st.markdown(f"**{home_team} vs {away_team}**")
     st.caption(f"🕐 {display_time(kickoff)}")
@@ -879,47 +891,3 @@ def _render_locked_match(user: dict, match: dict):
         st.warning("No prediction submitted for this match.")
 
     st.divider()
-
-# ─────────────────────────────────────────────
-# MAIN APP
-# ─────────────────────────────────────────────
-def main():
-    matches = fetch_matches_fd()
-    if matches:
-        try:
-            auto_settle(matches)
-        except Exception:
-            pass
-
-    if st.session_state.get("admin"):
-        admin_page()
-        return
-
-    user = st.session_state.get("user")
-    if not user:
-        login_page()
-        return
-
-    st.sidebar.title("👤 Your profile")
-    st.sidebar.write(f"Name: {user['name']}")
-    st.sidebar.write(f"Total points: {user['total_pts']}")
-
-    if st.sidebar.button("🏆 Leaderboard"):
-        st.session_state["page"] = "leaderboard"
-        st.rerun()
-
-    if st.sidebar.button("Log out"):
-        st.session_state.pop("user", None)
-        st.session_state["page"] = "predictions"
-        st.rerun()
-
-    page = st.session_state.get("page", "predictions")
-    if page == "leaderboard":
-        leaderboard_page()
-    else:
-        predictions_page(user, matches)
-
-if __name__ == "__main__":
-    main()
-
-# ─────────────────────────────────────────────
