@@ -740,7 +740,8 @@ def predictions_page(user: dict, matches: list):
         for md_label, md_matches in matchday_groups.items():
             with st.expander(f"📅 {md_label}", expanded=True):
                 round_ids = [m["id"] for m in md_matches]
-                _render_prediction_form(user, match, round_ids)
+                for match in md_matches:
+                    _render_prediction_form(user, match, round_ids)
 
 
     if live_finished:
