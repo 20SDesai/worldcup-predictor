@@ -234,6 +234,7 @@ def fetch_sofascore_events_for_world_cup() -> list:
                 "round_name": ev.get("tournamentRound", {}).get("name", ""),  # NEW
             })
 
+
         return out
     except Exception:
         return []
@@ -298,7 +299,10 @@ def _best_match_sofascore_event(fd_match: dict, ss_events: list) -> int | None:
         return None
 
     candidates.sort(key=lambda x: x[1])
-    return int(candidates[0][0]["id"])
+    best = candidates[0][0]
+    fd_match["round_name"] = best.get("tournamentRound", {}).get("name", "")
+    return int(best["id"])
+
 
 def get_sofascore_id_for_match(fd_match: dict, ss_events: list) -> int | None:
     match_id_fd = fd_match["id"]
@@ -450,7 +454,7 @@ def get_prediction(user_id, match_id):
     conn.close()
     return dict(row) if row else None
 
-def booster_used_this_matchday(user_id, matchday_match_ids, exclude_match_id=None):
+def booster_used_this_round(user_id, round_match_ids, exclude_match_id=None):
     conn = get_db()
     for mid in matchday_match_ids:
         if mid == exclude_match_id:
@@ -723,10 +727,12 @@ def predictions_page(user: dict, matches: list):
         matchday_groups: dict = {}
         for m in upcoming:
             round_name = m.get("round_name", "")
+
             if "Round" in round_name:
-                label = f"Matchday {round_name.split()[-1]}"
+                label = round_name  # e.g. "Round 1", "Round of 16"
             else:
-                label = "Matchday ?"
+                label = m.get("matchday", "Unknown Round")
+
 
             matchday_groups.setdefault(label, []).append(m)
 
@@ -790,16 +796,15 @@ def _render_prediction_form(user: dict, match: dict, matchday_ids: list):
             key=f"a_{match_id}"
         )
 
-    booster_already_used = booster_used_this_matchday(
-        user["id"], matchday_ids, exclude_match_id=match_id
-    )
+    booster_already_used = booster_used_this_matchday(user["id"], round_ids, exclude_match_id=match_id)
+
     current_boost = bool(saved and saved["booster_used"])
     if booster_already_used and not current_boost:
         st.caption("⚡ 2x booster already used this matchday.")
         booster = False
     else:
         booster = st.checkbox(
-            f"⚡ Use Matchday {matchday_number} Booster (2×)",
+            f"⚡ Use Booster for {round_name}",
             value=current_boost,
             key=f"b_{match_id}"
         )
