@@ -738,9 +738,10 @@ def predictions_page(user: dict, matches: list):
 
         for md_label, md_matches in matchday_groups.items():
             with st.expander(f"📅 {md_label}", expanded=True):
-                md_ids = [m["id"] for m in md_matches]
+                round_ids = [m["id"] for m in md_matches]
                 for match in md_matches:
-                    _render_prediction_form(user, match, md_ids)
+                    _render_prediction_form(user, match, round_ids)
+
 
     if live_finished:
         st.subheader("Live & finished matches")
@@ -796,7 +797,8 @@ def _render_prediction_form(user: dict, match: dict, matchday_ids: list):
             key=f"a_{match_id}"
         )
 
-    booster_already_used = booster_used_this_matchday(user["id"], round_ids, exclude_match_id=match_id)
+    booster_already_used = booster_used_this_round(user["id"], matchday_ids, exclude_match_id=match_id)
+
 
     current_boost = bool(saved and saved["booster_used"])
     if booster_already_used and not current_boost:
