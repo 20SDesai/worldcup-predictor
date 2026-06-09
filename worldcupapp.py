@@ -231,7 +231,9 @@ def fetch_sofascore_events_for_world_cup() -> list:
                 "home_team": ev.get("homeTeam", {}).get("name", ""),
                 "away_team": ev.get("awayTeam", {}).get("name", ""),
                 "start_ts": ev.get("startTimestamp"),
+                "round_name": ev.get("tournamentRound", {}).get("name", ""),  # NEW
             })
+
         return out
     except Exception:
         return []
@@ -720,9 +722,12 @@ def predictions_page(user: dict, matches: list):
         st.subheader("Upcoming matches")
         matchday_groups: dict = {}
         for m in upcoming:
-            label = m["matchday"]
-            if m.get("group"):
-                label = f"{m['group']} — {label}"
+            round_name = m.get("round_name", "")
+            if "Round" in round_name:
+                label = f"Matchday {round_name.split()[-1]}"
+            else:
+                label = "Matchday ?"
+
             matchday_groups.setdefault(label, []).append(m)
 
         for md_label, md_matches in matchday_groups.items():
@@ -738,6 +743,13 @@ def predictions_page(user: dict, matches: list):
 
 def _render_prediction_form(user: dict, match: dict, matchday_ids: list):
     match_id  = match["id"]
+    # Extract matchday number from SofaScore round name
+    round_name = match.get("round_name", "")
+    try:
+        matchday_number = int(round_name.split()[-1])  # "Round 1" → 1
+    except:
+        matchday_number = 1
+
     home_team = match["home_team"]
     away_team = match["away_team"]
     kickoff   = parse_kickoff(match["date"])
@@ -787,10 +799,11 @@ def _render_prediction_form(user: dict, match: dict, matchday_ids: list):
         booster = False
     else:
         booster = st.checkbox(
-            "⚡ Use 2x booster on this match",
+            f"⚡ Use Matchday {matchday_number} Booster (2×)",
             value=current_boost,
             key=f"b_{match_id}"
         )
+
 
     first_scorer = None
     first_team   = None
