@@ -890,4 +890,48 @@ def _render_locked_match(user: dict, match: dict):
     else:
         st.warning("No prediction submitted for this match.")
 
-    st.divider()
+    st.divider() 
+# MAIN APP
+# ─────────────────────────────────────────────
+def main():
+    matches = fetch_matches_fd()
+    if matches:
+        try:
+            auto_settle(matches)
+        except Exception:
+            pass
+
+    if st.session_state.get("admin"):
+        admin_page()
+        return
+
+    user = st.session_state.get("user")
+    if not user:
+        login_page()
+        return
+
+    st.sidebar.title("👤 Your profile")
+    st.sidebar.write(f"Name: {user['name']}")
+    st.sidebar.write(f"Total points: {user['total_pts']}")
+
+    if st.sidebar.button("🏆 Leaderboard"):
+        st.session_state["page"] = "leaderboard"
+        st.rerun()
+
+    if st.sidebar.button("Log out"):
+        st.session_state.pop("user", None)
+        st.session_state["page"] = "predictions"
+        st.rerun()
+
+    page = st.session_state.get("page", "predictions")
+    if page == "leaderboard":
+        leaderboard_page()
+    else:
+        predictions_page(user, matches)
+
+
+if __name__ == "__main__":
+    main()
+
+# ─────────────────────────────────────────────
+
