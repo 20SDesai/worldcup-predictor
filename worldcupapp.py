@@ -624,13 +624,27 @@ def booster_used_this_stage(user_id: int, stage_match_ids: list, exclude_match_i
         round_of_32, round_of_16, quarterfinal, semifinal, final
     """
     conn = get_db()
-    for mid in stage_match_ids:
-        if mid == exclude_match_id:
+    # Normalise all IDs to the same type to avoid sqlite3.InterfaceError
+    def _norm(v):
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return str(v)
+
+    uid        = _norm(user_id)
+    exc        = _norm(exclude_match_id) if exclude_match_id is not None else None
+    safe_ids   = [_norm(m) for m in (stage_match_ids or [])]
+
+    for mid in safe_ids:
+        if mid == exc:
             continue
-        row = conn.execute(
-            "SELECT booster_used FROM predictions WHERE user_id=? AND match_id=?",
-            (user_id, mid)
-        ).fetchone()
+        try:
+            row = conn.execute(
+                "SELECT booster_used FROM predictions WHERE user_id=? AND match_id=?",
+                (uid, mid)
+            ).fetchone()
+        except Exception:
+            continue
         if row and row["booster_used"]:
             return True
     return False
@@ -1278,10 +1292,16 @@ def predictions_page(user: dict, matches: list):
         return
 
     # Build a lookup: stage_bucket -> list of ALL match IDs (for booster scoping)
+    # Explicitly cast to int to avoid sqlite3.InterfaceError from API returning
+    # IDs as floats, strings, or other unexpected types.
     bucket_ids: dict = {}
     for m in matches:
         b = stage_bucket(m)
-        bucket_ids.setdefault(b, []).append(m["id"])
+        try:
+            mid = int(m["id"])
+        except (TypeError, ValueError):
+            mid = str(m["id"])
+        bucket_ids.setdefault(b, []).append(mid)
 
     # Group every match by its stage bucket
     bucket_matches: dict = {}
