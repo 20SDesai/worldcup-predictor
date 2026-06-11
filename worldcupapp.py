@@ -922,7 +922,7 @@ def admin_restore_backup():
 
     backup_files = sorted(
         glob.glob(os.path.join(BACKUP_DIR, "worldcup_*.db")),
-        reverse=True   # newest first
+        reverse=True
     )
 
     if not backup_files:
@@ -932,9 +932,8 @@ def admin_restore_backup():
             st.rerun()
         return
 
-    # Build display labels from filenames
     def _label(path):
-        fname = os.path.basename(path)            # worldcup_20250610_143022.db
+        fname = os.path.basename(path)
         try:
             ts_part = fname.replace("worldcup_", "").replace(".db", "")
             dt = datetime.strptime(ts_part, "%Y%m%d_%H%M%S")
@@ -942,11 +941,10 @@ def admin_restore_backup():
         except Exception:
             return fname
 
-    labels      = [_label(p) for p in backup_files]
-    selected_lbl = st.selectbox("Select a backup to restore", labels)
+    labels        = [_label(p) for p in backup_files]
+    selected_lbl  = st.selectbox("Select a backup to restore", labels)
     selected_path = backup_files[labels.index(selected_lbl)]
 
-    # Show a basic summary of what's inside the chosen backup
     try:
         tmp_conn = sqlite3.connect(selected_path)
         tmp_conn.row_factory = sqlite3.Row
@@ -961,25 +959,17 @@ def admin_restore_backup():
             st.rerun()
         return
 
-    # Two-step confirmation to avoid accidental restores
     confirmed = st.checkbox("I understand this will overwrite the live database")
 
     if confirmed:
         if st.button("🔄 Restore now", type="primary"):
             try:
-                # Safety-backup current DB first
                 run_backup()
-
-                # Close the shared connection before overwriting
-                # (SQLite on disk — shutil.copy2 is safe here)
                 shutil.copy2(selected_path, DB_PATH)
-
-                # Clear any cached connection so the app re-opens the restored DB
                 st.cache_resource.clear()
-
                 st.success(
                     "✅ Restore complete! The database has been replaced with the "
-                    f"selected snapshot. Reload the app to see the restored data."
+                    "selected snapshot. Reload the app to see the restored data."
                 )
                 st.info("A safety backup of the previous live database was saved before overwriting.")
             except Exception as e:
@@ -1298,8 +1288,6 @@ def admin_override_result():
                 settle_match(mid, result, bool(override["is_knockout"]))
                 st.success("✅ Re-settle complete! All predictions rescored against the corrected result.")
                 st.rerun()
-
-    st.divider()
 
     # ── Saved overrides log ───────────────────────────────────────────────
     with st.expander("📋 All saved overrides"):
@@ -1911,24 +1899,66 @@ def _render_locked_match(user: dict, match: dict):
     away_team = match["away_team"]
     kickoff   = parse_kickoff(match["date"])
     saved     = get_prediction(user["id"], match_id)
+    conn      = get_db()
 
-    st.markdown(f"**{home_team} vs {away_team}**")
+    # ── Match header ──────────────────────────────────────────────────────
+    st.markdown(f"#### {home_team} vs {away_team}")
     st.caption(f"🕐 {display_time(kickoff)}")
 
     if match["status"] == "finished":
-        st.write(f"Final score: {match['home_score']} – {match['away_score']}")
+        hg = match.get("home_score") if match.get("home_score") is not None else match.get("home_goals")
+        ag = match.get("away_score") if match.get("away_score") is not None else match.get("away_goals")
+        st.markdown(f"**Final score: {hg} – {ag}**")
     elif match["status"] == "live":
-        st.write("Match in progress.")
+        st.markdown("🔴 **Match in progress**")
     else:
-        st.write("Match scheduled / not started.")
+        st.markdown("⏳ Locked — awaiting kick-off")
 
+    # ── Your prediction highlight ─────────────────────────────────────────
     if saved:
-        st.info(
-            f"Your prediction: {saved['home_goals']} – {saved['away_goals']}"
-            + (" ⚡2x" if saved["booster_used"] else "")
-        )
+        booster_tag = " ⚡ 2x" if saved["booster_used"] else ""
+        pts_tag     = f"  •  **{saved['points']} pts**" if saved.get("settled") else ""
+        st.info(f"Your prediction: **{saved['home_goals']} – {saved['away_goals']}**{booster_tag}{pts_tag}")
     else:
-        st.warning("No prediction submitted for this match.")
+        st.warning("You did not submit a prediction for this match.")
+
+    # ── Everyone's predictions table ──────────────────────────────────────
+    all_preds = conn.execute("""
+        SELECT u.name, p.home_goals, p.away_goals,
+               p.first_scorer, p.first_team,
+               p.booster_used, p.points, p.settled
+        FROM predictions p
+        JOIN users u ON u.id = p.user_id
+        WHERE p.match_id = ?
+        ORDER BY p.points DESC, u.name ASC
+    """, (str(match_id),)).fetchall()
+
+    if all_preds:
+        with st.expander(f"👥 See all predictions ({len(all_preds)} player{'s' if len(all_preds)!=1 else ''})", expanded=False):
+            rows = []
+            for p in all_preds:
+                name     = p["name"].title()
+                score    = f"{p['home_goals']} – {p['away_goals']}"
+                booster  = "⚡" if p["booster_used"] else ""
+                pts      = str(p["points"]) if p["settled"] else "–"
+                scorer   = p["first_scorer"] or "–"
+                team     = p["first_team"]   or "–"
+                # Highlight the current user's row
+                marker   = " 👈" if p["name"] == user["name"] else ""
+                rows.append({
+                    "Player":        name + marker,
+                    "Prediction":    score,
+                    "Booster":       booster,
+                    "First Scorer":  scorer,
+                    "First Team":    team,
+                    "Points":        pts,
+                })
+            import pandas as pd
+            df = pd.DataFrame(rows)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+    else:
+        with st.expander("👥 Predictions"):
+            st.caption("No predictions submitted for this match.")
 
     st.divider()
 
@@ -2001,3 +2031,4 @@ if __name__ == "__main__":
     main()
 
 # ─────────────────────────────────────────────
+
