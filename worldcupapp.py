@@ -118,6 +118,17 @@ def init_db():
             attempted_at TEXT NOT NULL,
             success      INTEGER DEFAULT 0
         );
+
+        CREATE TABLE IF NOT EXISTS match_overrides (
+            match_id      TEXT PRIMARY KEY,
+            home_goals    INTEGER NOT NULL,
+            away_goals    INTEGER NOT NULL,
+            first_scorer  TEXT,
+            first_team    TEXT,
+            is_knockout   INTEGER DEFAULT 0,
+            override_ts   TEXT    DEFAULT (datetime('now')),
+            reason        TEXT
+        );
     """)
     conn.commit()
 
@@ -168,6 +179,7 @@ def maybe_backup():
 # AUTH HELPERS
 # ─────────────────────────────────────────────
 def get_or_create_user(name: str, pin: str):
+    """Legacy helper kept for invite-link flows."""
     conn       = get_db()
     clean_name = name.strip().lower()
     existing   = conn.execute("SELECT * FROM users WHERE name=?", (clean_name,)).fetchone()
@@ -186,6 +198,37 @@ def verify_user(name: str, pin: str):
         "SELECT * FROM users WHERE name=? AND pin=?", (name, pin)
     ).fetchone()
     return dict(user) if user else None
+
+def register_user(name: str, pin: str):
+    """
+    Create a brand-new account.
+    Returns (user_dict, None) on success.
+    Returns (None, error_message) if the name is already taken.
+    """
+    conn       = get_db()
+    clean_name = name.strip().lower()
+    existing   = conn.execute("SELECT id FROM users WHERE name=?", (clean_name,)).fetchone()
+    if existing:
+        return None, "That name is already registered. Please log in instead."
+    conn.execute("INSERT INTO users (name, pin) VALUES (?, ?)", (clean_name, pin))
+    conn.commit()
+    user = conn.execute("SELECT * FROM users WHERE name=?", (clean_name,)).fetchone()
+    return dict(user), None
+
+def login_user(name: str, pin: str):
+    """
+    Log in to an existing account.
+    Returns (user_dict, None) on success.
+    Returns (None, error_message) if name not found or PIN wrong.
+    """
+    conn       = get_db()
+    clean_name = name.strip().lower()
+    existing   = conn.execute("SELECT * FROM users WHERE name=?", (clean_name,)).fetchone()
+    if not existing:
+        return None, "Name not found. Please register first."
+    if existing["pin"] != pin:
+        return None, "Incorrect PIN."
+    return dict(existing), None
 
 def generate_invite_links(names: list):
     links = {}
@@ -535,6 +578,17 @@ def settle_match(match_id, result, is_knockout):
     if already:
         return
 
+    # Apply admin override if one exists for this match
+    override = get_match_override(match_id)
+    if override:
+        result = {
+            "home_goals":   override["home_goals"],
+            "away_goals":   override["away_goals"],
+            "first_scorer": override["first_scorer"],
+            "first_team":   override["first_team"],
+        }
+        is_knockout = bool(override["is_knockout"])
+
     preds = [dict(p) for p in conn.execute(
         "SELECT * FROM predictions WHERE match_id=?", (match_id,)
     ).fetchall()]
@@ -580,6 +634,36 @@ def mark_settle_attempted(match_id: str, success: bool):
         "INSERT OR REPLACE INTO settle_log (match_id, attempted_at, success) VALUES (?,?,?)",
         (match_id, datetime.utcnow().isoformat(), 1 if success else 0)
     )
+    conn.commit()
+
+def get_match_override(match_id: str):
+    """Return the admin-overridden result for a match, or None."""
+    conn = get_db()
+    row  = conn.execute(
+        "SELECT * FROM match_overrides WHERE match_id=?", (str(match_id),)
+    ).fetchone()
+    return dict(row) if row else None
+
+def unsettle_match(match_id):
+    """
+    Reverse a previous settlement so the match can be re-scored.
+    Deducts the points that were awarded during the original settlement
+    then clears settled=1 so settle_match() can run again cleanly.
+    """
+    conn  = get_db()
+    preds = conn.execute(
+        "SELECT * FROM predictions WHERE match_id=? AND settled=1", (str(match_id),)
+    ).fetchall()
+    for p in preds:
+        conn.execute(
+            "UPDATE users SET total_pts = total_pts - ? WHERE id=?",
+            (p["points"], p["user_id"])
+        )
+        conn.execute(
+            "UPDATE predictions SET points=0, settled=0 WHERE id=?", (p["id"],)
+        )
+    # Remove the settle_log entry so settle_match won't short-circuit
+    conn.execute("DELETE FROM settle_log WHERE match_id=?", (str(match_id),))
     conn.commit()
 
 # ─────────────────────────────────────────────
@@ -716,38 +800,76 @@ def auto_settle(matches):
 def login_page():
     st.title("⚽ World Cup 2026 Predictor")
 
+    # ── Invite-link auto-login (query params) ──────────────────────────────
     params       = st.query_params
     default_name = params.get("user", "")
     default_pin  = params.get("pin", "")
+    if default_name and default_pin:
+        user = verify_user(default_name, default_pin)
+        if user:
+            st.session_state["user"] = user
+            st.session_state["page"] = "predictions"
+            st.rerun()
 
-    name   = st.text_input("Your name", value=default_name)
-    pin    = st.text_input("PIN (4 digits)", value=default_pin, max_chars=4, type="password")
-    league = st.text_input("League code", type="password")
+    # ── Tab switcher ────────────────────────────────────────────────────────
+    tab_login, tab_register, tab_admin = st.tabs(["🔑 Login", "📝 Register", "🔧 Admin"])
 
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("Login / Register"):
-            if not name or not pin.isdigit() or len(pin) != 4:
-                st.error("Enter a valid name and 4-digit PIN.")
-            elif league != LEAGUE_CODE:
+    # ── LOGIN ───────────────────────────────────────────────────────────────
+    with tab_login:
+        st.subheader("Welcome back")
+        l_name   = st.text_input("Your name", key="login_name")
+        l_pin    = st.text_input("PIN (4 digits)", max_chars=4, type="password", key="login_pin")
+        l_league = st.text_input("League code", type="password", key="login_league")
+
+        if st.button("Login", key="btn_login", type="primary"):
+            if not l_name:
+                st.error("Please enter your name.")
+            elif not l_pin.isdigit() or len(l_pin) != 4:
+                st.error("PIN must be exactly 4 digits.")
+            elif l_league != LEAGUE_CODE:
                 st.error("Incorrect league code.")
             else:
-                user = get_or_create_user(name, pin)
-                if user:
+                user, err = login_user(l_name, l_pin)
+                if err:
+                    st.error(err)
+                else:
                     st.session_state["user"] = user
                     st.session_state["page"] = "predictions"
                     st.rerun()
+
+    # ── REGISTER ────────────────────────────────────────────────────────────
+    with tab_register:
+        st.subheader("Create an account")
+        r_name    = st.text_input("Choose a name", key="reg_name")
+        r_pin     = st.text_input("Choose a 4-digit PIN", max_chars=4, type="password", key="reg_pin")
+        r_pin2    = st.text_input("Confirm PIN", max_chars=4, type="password", key="reg_pin2")
+        r_league  = st.text_input("League code", type="password", key="reg_league")
+
+        if st.button("Register", key="btn_register", type="primary"):
+            if not r_name:
+                st.error("Please enter a name.")
+            elif not r_pin.isdigit() or len(r_pin) != 4:
+                st.error("PIN must be exactly 4 digits.")
+            elif r_pin != r_pin2:
+                st.error("PINs do not match.")
+            elif r_league != LEAGUE_CODE:
+                st.error("Incorrect league code.")
+            else:
+                user, err = register_user(r_name, r_pin)
+                if err:
+                    st.error(err)
                 else:
-                    st.error("Wrong PIN.")
+                    st.success(f"Account created! Welcome, {user['name'].title()} 🎉")
+                    st.session_state["user"] = user
+                    st.session_state["page"] = "predictions"
+                    st.rerun()
 
-    with col2:
-        if st.button("Admin panel"):
-            st.session_state["awaiting_admin_pin"] = True
-            st.rerun()
-
+    # ── ADMIN ────────────────────────────────────────────────────────────────
+    with tab_admin:
+        st.subheader("Admin access")
         if st.session_state.get("awaiting_admin_pin"):
             admin_pin = st.text_input("Enter admin PIN", type="password", key="admin_pin_input")
-            if st.button("Submit PIN"):
+            if st.button("Submit PIN", key="btn_admin_submit"):
                 if admin_pin == ADMIN_PIN:
                     st.session_state["admin"] = True
                     st.session_state.pop("awaiting_admin_pin", None)
@@ -756,6 +878,10 @@ def login_page():
                     st.error("Incorrect admin PIN.")
                     st.session_state.pop("awaiting_admin_pin", None)
                     st.rerun()
+        else:
+            if st.button("Open Admin Panel", key="btn_admin_open"):
+                st.session_state["awaiting_admin_pin"] = True
+                st.rerun()
 
 # ─────────────────────────────────────────────
 # UI — ADMIN
@@ -863,6 +989,335 @@ def admin_restore_backup():
         st.session_state["admin_page"] = "main"
         st.rerun()
 
+
+def admin_manual_points():
+    st.title("✏️ Manually Adjust Points")
+    st.info(
+        "Use this panel to correct a player's points for a specific match — "
+        "for example if the API returned a wrong score and predictions were "
+        "settled incorrectly. Changes are logged in the database."
+    )
+
+    conn  = get_db()
+    users = conn.execute("SELECT id, name, total_pts FROM users ORDER BY name ASC").fetchall()
+
+    if not users:
+        st.warning("No users found.")
+        if st.button("← Back"):
+            st.session_state["admin_page"] = "main"
+            st.rerun()
+        return
+
+    # ── Step 1: pick a user ────────────────────────────────────────────────
+    user_labels = {f"{u['name'].title()} (ID {u['id']}, {u['total_pts']} pts)": u for u in users}
+    chosen_label = st.selectbox("Select player", list(user_labels.keys()))
+    chosen_user  = user_labels[chosen_label]
+
+    # ── Step 2: pick a match from that user's settled predictions ──────────
+    preds = conn.execute(
+        """SELECT p.id, p.match_id, p.home_goals, p.away_goals,
+                  p.points, p.booster_used, p.settled
+           FROM predictions p
+           WHERE p.user_id = ?
+           ORDER BY p.match_id ASC""",
+        (chosen_user["id"],)
+    ).fetchall()
+
+    if not preds:
+        st.info("This player has no predictions yet.")
+        if st.button("← Back"):
+            st.session_state["admin_page"] = "main"
+            st.rerun()
+        return
+
+    pred_labels = {
+        f"Match {p['match_id']}  |  {p['home_goals']}–{p['away_goals']}  |  "
+        f"{p['points']} pts  {'(settled)' if p['settled'] else '(unsettled)'}": p
+        for p in preds
+    }
+    chosen_pred_label = st.selectbox("Select prediction / match", list(pred_labels.keys()))
+    chosen_pred       = pred_labels[chosen_pred_label]
+
+    st.markdown("---")
+    st.markdown(f"**Current points for this prediction:** `{chosen_pred['points']}`")
+
+    # ── Step 3: enter correction ───────────────────────────────────────────
+    col_a, col_b = st.columns(2)
+    with col_a:
+        new_pts = st.number_input(
+            "New points for this prediction",
+            min_value=0, max_value=200,
+            value=int(chosen_pred["points"] or 0),
+            step=1,
+            key="manual_new_pts"
+        )
+    with col_b:
+        reason = st.text_input(
+            "Reason (shown in audit log)",
+            placeholder="e.g. API score was wrong, corrected to 2-1",
+            key="manual_reason"
+        )
+
+    delta = new_pts - int(chosen_pred["points"] or 0)
+    if delta > 0:
+        st.success(f"This will **add {delta} pts** to {chosen_user['name'].title()}'s total.")
+    elif delta < 0:
+        st.warning(f"This will **remove {abs(delta)} pts** from {chosen_user['name'].title()}'s total.")
+    else:
+        st.caption("No change in points.")
+
+    confirmed = st.checkbox("I confirm this adjustment is correct")
+
+    if confirmed and st.button("✅ Apply adjustment", type="primary"):
+        if not reason.strip():
+            st.error("Please enter a reason before applying.")
+        else:
+            try:
+                # Update the prediction row
+                conn.execute(
+                    "UPDATE predictions SET points = ? WHERE id = ?",
+                    (new_pts, chosen_pred["id"])
+                )
+                # Adjust the user's total by the delta only
+                conn.execute(
+                    "UPDATE users SET total_pts = total_pts + ? WHERE id = ?",
+                    (delta, chosen_user["id"])
+                )
+                # Write to audit log table (create if not exists)
+                conn.execute("""
+                    CREATE TABLE IF NOT EXISTS points_audit (
+                        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                        ts          TEXT    DEFAULT (datetime('now')),
+                        user_id     INTEGER,
+                        pred_id     INTEGER,
+                        match_id    INTEGER,
+                        old_pts     INTEGER,
+                        new_pts     INTEGER,
+                        delta       INTEGER,
+                        reason      TEXT
+                    )
+                """)
+                conn.execute(
+                    """INSERT INTO points_audit
+                       (user_id, pred_id, match_id, old_pts, new_pts, delta, reason)
+                       VALUES (?,?,?,?,?,?,?)""",
+                    (
+                        chosen_user["id"],
+                        chosen_pred["id"],
+                        chosen_pred["match_id"],
+                        int(chosen_pred["points"] or 0),
+                        new_pts,
+                        delta,
+                        reason.strip(),
+                    )
+                )
+                conn.commit()
+                st.success(
+                    f"✅ Done! {chosen_user['name'].title()}'s points for match "
+                    f"{chosen_pred['match_id']} updated from "
+                    f"{int(chosen_pred['points'] or 0)} → {new_pts} (Δ {delta:+d})."
+                )
+                st.rerun()
+            except Exception as e:
+                st.error(f"Failed to apply adjustment: {e}")
+
+    st.divider()
+
+    # ── Audit log viewer ───────────────────────────────────────────────────
+    with st.expander("📋 View points audit log"):
+        try:
+            log = conn.execute(
+                """SELECT a.ts, u.name, a.match_id, a.old_pts, a.new_pts,
+                          a.delta, a.reason
+                   FROM points_audit a
+                   JOIN users u ON u.id = a.user_id
+                   ORDER BY a.ts DESC LIMIT 100"""
+            ).fetchall()
+            if log:
+                import pandas as pd
+                df = pd.DataFrame([dict(r) for r in log])
+                df.columns = ["Time (UTC)", "Player", "Match ID",
+                              "Old pts", "New pts", "Δ", "Reason"]
+                st.dataframe(df, use_container_width=True)
+            else:
+                st.info("No adjustments recorded yet.")
+        except Exception:
+            st.info("No adjustments recorded yet.")
+
+    if st.button("← Back"):
+        st.session_state["admin_page"] = "main"
+        st.rerun()
+
+
+def admin_override_result():
+    st.title("🔧 Override Match Result")
+    st.info(
+        "Use this to manually set the official result for a match — including "
+        "score, first scorer, and first team to score. "
+        "Once saved, you can re-settle the match so all players' points are "
+        "recalculated against the corrected result."
+    )
+
+    conn    = get_db()
+    matches = fetch_matches_fd()
+
+    if not matches:
+        st.warning("Could not load matches from the API.")
+        if st.button("← Back"):
+            st.session_state["admin_page"] = "main"
+            st.rerun()
+        return
+
+    # Build display labels
+    def _mlabel(m):
+        ko = parse_kickoff(m["date"])
+        date_str = display_time(ko)
+        return f"{m.get('home_team','?')} vs {m.get('away_team','?')}  |  {date_str}  (ID {m['id']})"
+
+    match_map   = {_mlabel(m): m for m in matches}
+    chosen_lbl  = st.selectbox("Select match", list(match_map.keys()))
+    chosen_match = match_map[chosen_lbl]
+    mid          = str(chosen_match["id"])
+    is_ko        = (chosen_match.get("stage", "").lower() not in GROUP_STAGES)
+
+    # Pre-fill from existing override or API result
+    existing_override = get_match_override(mid)
+    api_home = chosen_match.get("home_goals") or 0
+    api_away = chosen_match.get("away_goals") or 0
+    api_scorer = chosen_match.get("first_scorer") or ""
+    api_team   = chosen_match.get("first_team")   or chosen_match.get("home_team", "")
+
+    default_home   = existing_override["home_goals"]   if existing_override else api_home
+    default_away   = existing_override["away_goals"]   if existing_override else api_away
+    default_scorer = existing_override["first_scorer"] if existing_override else api_scorer
+    default_team   = existing_override["first_team"]   if existing_override else api_team
+
+    if existing_override:
+        st.success("✅ An override already exists for this match — editing it below.")
+
+    st.markdown("---")
+    st.subheader("📝 Correct result")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        home_goals = st.number_input(
+            f"{chosen_match.get('home_team','Home')} goals",
+            min_value=0, max_value=30,
+            value=int(default_home), step=1, key="ov_home"
+        )
+    with col2:
+        away_goals = st.number_input(
+            f"{chosen_match.get('away_team','Away')} goals",
+            min_value=0, max_value=30,
+            value=int(default_away), step=1, key="ov_away"
+        )
+
+    st.subheader("⚡ Knockout extras (optional)")
+    first_scorer = st.text_input(
+        "First goalscorer (leave blank if N/A)",
+        value=default_scorer, key="ov_scorer"
+    )
+
+    team_options = [chosen_match.get("home_team","Home"), chosen_match.get("away_team","Away"), "None"]
+    default_team_idx = team_options.index(default_team) if default_team in team_options else 0
+    first_team = st.selectbox(
+        "First team to score",
+        team_options,
+        index=default_team_idx,
+        key="ov_team"
+    )
+    first_team = None if first_team == "None" else first_team
+
+    override_reason = st.text_input(
+        "Reason for override",
+        placeholder="e.g. API returned 1-0 but correct score was 2-1",
+        key="ov_reason"
+    )
+
+    st.markdown("---")
+    col_save, col_resettle = st.columns(2)
+
+    with col_save:
+        st.markdown("**Step 1 — Save override**")
+        st.caption("Stores the corrected result. Does not yet change any points.")
+        if st.button("💾 Save override", key="btn_save_override", type="primary"):
+            if not override_reason.strip():
+                st.error("Please enter a reason.")
+            else:
+                conn.execute("""
+                    INSERT INTO match_overrides
+                        (match_id, home_goals, away_goals, first_scorer,
+                         first_team, is_knockout, reason)
+                    VALUES (?,?,?,?,?,?,?)
+                    ON CONFLICT(match_id) DO UPDATE SET
+                        home_goals   = excluded.home_goals,
+                        away_goals   = excluded.away_goals,
+                        first_scorer = excluded.first_scorer,
+                        first_team   = excluded.first_team,
+                        is_knockout  = excluded.is_knockout,
+                        override_ts  = datetime('now'),
+                        reason       = excluded.reason
+                """, (mid, home_goals, away_goals,
+                      first_scorer.strip() or None,
+                      first_team, 1 if is_ko else 0,
+                      override_reason.strip()))
+                conn.commit()
+                st.success(f"Override saved: {home_goals}–{away_goals}, "
+                           f"scorer: {first_scorer or '—'}, "
+                           f"first team: {first_team or '—'}")
+                st.rerun()
+
+    with col_resettle:
+        st.markdown("**Step 2 — Re-settle predictions**")
+        st.caption(
+            "Reverses all previously awarded points for this match, "
+            "then re-scores every prediction against the corrected result."
+        )
+        settled_count = conn.execute(
+            "SELECT COUNT(*) FROM predictions WHERE match_id=? AND settled=1", (mid,)
+        ).fetchone()[0]
+
+        if settled_count:
+            st.warning(f"{settled_count} settled prediction(s) will be recalculated.")
+        else:
+            st.info("No settled predictions for this match yet.")
+
+        confirmed_rs = st.checkbox("Confirm re-settle", key="ov_confirm")
+        if confirmed_rs and st.button("🔄 Re-settle now", key="btn_resettle", type="primary"):
+            override = get_match_override(mid)
+            if not override:
+                st.error("Save an override first (Step 1).")
+            else:
+                unsettle_match(mid)
+                result = {
+                    "home_goals":   override["home_goals"],
+                    "away_goals":   override["away_goals"],
+                    "first_scorer": override["first_scorer"],
+                    "first_team":   override["first_team"],
+                }
+                settle_match(mid, result, bool(override["is_knockout"]))
+                st.success("✅ Re-settle complete! All predictions rescored against the corrected result.")
+                st.rerun()
+
+    st.divider()
+
+    # ── Saved overrides log ───────────────────────────────────────────────
+    with st.expander("📋 All saved overrides"):
+        rows = conn.execute(
+            "SELECT * FROM match_overrides ORDER BY override_ts DESC"
+        ).fetchall()
+        if rows:
+            import pandas as pd
+            df = pd.DataFrame([dict(r) for r in rows])
+            df.columns = [c.replace("_", " ").title() for c in df.columns]
+            st.dataframe(df, use_container_width=True)
+        else:
+            st.info("No overrides saved yet.")
+
+    if st.button("← Back"):
+        st.session_state["admin_page"] = "main"
+        st.rerun()
+
 def admin_page():
     st.title("🔧 Admin Control Panel")
 
@@ -881,6 +1336,12 @@ def admin_page():
             st.rerun()
         if st.button("♻️ Restore from Backup"):
             st.session_state["admin_page"] = "restore"
+            st.rerun()
+        if st.button("✏️ Manually Adjust Points"):
+            st.session_state["admin_page"] = "manual_points"
+            st.rerun()
+        if st.button("🔧 Override Match Result"):
+            st.session_state["admin_page"] = "override_result"
             st.rerun()
 
         st.divider()
@@ -909,6 +1370,10 @@ def admin_page():
         admin_view_user_predictions()
     elif page == "restore":
         admin_restore_backup()
+    elif page == "manual_points":
+        admin_manual_points()
+    elif page == "override_result":
+        admin_override_result()
 
 def admin_view_user_predictions():
     st.title("📄 View User Predictions")
