@@ -2,6 +2,7 @@ import streamlit as st
 import sqlite3
 import requests
 import random
+import json
 from datetime import datetime, timedelta
 from collections import Counter
 from zoneinfo import ZoneInfo
@@ -131,6 +132,14 @@ def init_db():
         );
     """)
     conn.commit()
+
+    # Migration: add points_breakdown column if it doesn't already exist
+    # (older databases were created before this feature was added).
+    try:
+        conn.execute("ALTER TABLE predictions ADD COLUMN points_breakdown TEXT")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # column already exists
 
 init_db()
 
@@ -592,6 +601,52 @@ def score_prediction(pred, result, is_knockout):
 
     return points
 
+def build_points_breakdown(pred, result, is_knockout, underdog_bonus=False):
+    """
+    Returns a list of {"label": str, "points": int} items describing exactly
+    how a prediction's final point total was made up. Mirrors the rules
+    applied in settle_match(), including the underdog bonus and booster
+    doubling — so summing the "points" values always equals the
+    prediction's final stored `points`.
+
+    Returns an empty list if the result is incomplete (nothing to score yet).
+    """
+    parts = []
+    ph = pred.get("home_goals")
+    pa = pred.get("away_goals")
+    rh = result.get("home_goals")
+    ra = result.get("away_goals")
+
+    if ph is None or pa is None or rh is None or ra is None:
+        return parts
+
+    if outcome(ph, pa) == outcome(rh, ra):
+        parts.append({"label": "Correct result (win/draw/loss)", "points": 3})
+    if ph == rh:
+        parts.append({"label": f"Correct home team score ({ph})", "points": 1})
+    if pa == ra:
+        parts.append({"label": f"Correct away team score ({pa})", "points": 1})
+    if (ph - pa) == (rh - ra):
+        parts.append({"label": "Correct goal difference", "points": 1})
+
+    if is_knockout:
+        if pred.get("first_scorer") and pred["first_scorer"] == result.get("first_scorer"):
+            parts.append({"label": f"First goalscorer correct ({pred['first_scorer']})", "points": 2})
+        if pred.get("first_team") and pred["first_team"] == result.get("first_team"):
+            parts.append({"label": f"First team to score correct ({pred['first_team']})", "points": 1})
+
+    if underdog_bonus:
+        parts.append({"label": "Underdog bonus (rare exact scoreline)", "points": 2})
+
+    if pred.get("booster_used"):
+        subtotal = sum(p["points"] for p in parts)
+        parts.append({
+            "label": f"⚡ Booster doubled total ({subtotal} → {subtotal * 2})",
+            "points": subtotal,
+        })
+
+    return parts
+
 def settle_match(match_id, result, is_knockout):
     conn    = get_db()
     already = conn.execute(
@@ -633,13 +688,17 @@ def settle_match(match_id, result, is_knockout):
 
     for pred in preds:
         pts = score_prediction(pred, result, is_knockout)
-        if underdog(pred):
+        is_underdog = underdog(pred)
+        if is_underdog:
             pts += 2
         if pred["booster_used"]:
             pts *= 2
+
+        breakdown = build_points_breakdown(pred, result, is_knockout, is_underdog)
+
         conn.execute(
-            "UPDATE predictions SET points=?, settled=1 WHERE id=?",
-            (pts, pred["id"])
+            "UPDATE predictions SET points=?, points_breakdown=?, settled=1 WHERE id=?",
+            (pts, json.dumps(breakdown), pred["id"])
         )
         conn.execute(
             "UPDATE users SET total_pts = total_pts + ? WHERE id=?",
@@ -690,7 +749,7 @@ def unsettle_match(match_id):
             (p["points"], p["user_id"])
         )
         conn.execute(
-            "UPDATE predictions SET points=0, settled=0 WHERE id=?", (p["id"],)
+            "UPDATE predictions SET points=0, points_breakdown=NULL, settled=0 WHERE id=?", (p["id"],)
         )
     # Remove the settle_log entry so settle_match won't short-circuit
     conn.execute("DELETE FROM settle_log WHERE match_id=?", (str(match_id),))
@@ -780,7 +839,7 @@ def get_prediction_history(user_id: int) -> list:
     conn = get_db()
     rows = conn.execute(
         """SELECT match_id, home_goals, away_goals, booster_used,
-                  first_scorer, first_team, points, settled
+                  first_scorer, first_team, points, settled, points_breakdown
            FROM predictions
            WHERE user_id=? AND settled=1
            ORDER BY match_id DESC""",
@@ -1622,6 +1681,35 @@ def leaderboard_page(matches: list):
         st.rerun()
 
 # ─────────────────────────────────────────────
+# UI — POINTS BREAKDOWN HELPER
+# ─────────────────────────────────────────────
+def _render_points_breakdown(pred_row: dict):
+    """
+    Render an expander showing exactly how a settled prediction's points
+    were earned. `pred_row` must contain "points" and "points_breakdown"
+    (a JSON-encoded list produced by build_points_breakdown()).
+    """
+    try:
+        breakdown = json.loads(pred_row.get("points_breakdown") or "[]")
+    except (TypeError, ValueError):
+        breakdown = []
+
+    total_pts = pred_row.get("points") or 0
+
+    if breakdown:
+        with st.expander(f"ℹ️ How {total_pts} pts were earned"):
+            for item in breakdown:
+                st.markdown(f"- {item['label']}: **+{item['points']} pts**")
+    elif total_pts == 0:
+        with st.expander("ℹ️ How 0 pts were earned"):
+            st.caption("None of the scoring criteria were matched for this prediction.")
+    else:
+        st.caption(
+            "ℹ️ Detailed breakdown not available for this match — run "
+            "**Recalculate All Settled Matches** in the admin panel to generate it."
+        )
+
+# ─────────────────────────────────────────────
 # UI — PREDICTION HISTORY
 # ─────────────────────────────────────────────
 def history_page(user: dict, matches: list):
@@ -1669,6 +1757,8 @@ def history_page(user: dict, matches: list):
                 f"+{h['points']} pts</span>",
                 unsafe_allow_html=True,
             )
+
+        _render_points_breakdown(h)
 
         st.divider()
 
@@ -2139,6 +2229,9 @@ def _render_locked_match(user: dict, match: dict):
         booster_tag = " ⚡ 2x" if saved["booster_used"] else ""
         pts_tag     = f"  •  **{saved['points']} pts**" if saved.get("settled") else ""
         st.info(f"Your prediction: **{saved['home_goals']} – {saved['away_goals']}**{booster_tag}{pts_tag}")
+
+        if saved.get("settled"):
+            _render_points_breakdown(saved)
     else:
         st.warning("You did not submit a prediction for this match.")
 
