@@ -230,6 +230,29 @@ def login_user(name: str, pin: str):
         return None, "Incorrect PIN."
     return dict(existing), None
 
+def change_username(user_id: int, new_name: str):
+    """
+    Rename a user's account.
+    Returns (success: bool, message: str).
+    """
+    conn       = get_db()
+    clean_name = new_name.strip().lower()
+
+    if not clean_name:
+        return False, "Please enter a name."
+    if len(clean_name) > 30:
+        return False, "Name is too long (max 30 characters)."
+
+    existing = conn.execute(
+        "SELECT id FROM users WHERE name=? AND id!=?", (clean_name, user_id)
+    ).fetchone()
+    if existing:
+        return False, "That name is already taken — please choose another."
+
+    conn.execute("UPDATE users SET name=? WHERE id=?", (clean_name, user_id))
+    conn.commit()
+    return True, f"Your name has been updated to \"{clean_name.title()}\"."
+
 def generate_invite_links(names: list):
     links = {}
     conn  = get_db()
@@ -596,8 +619,15 @@ def settle_match(match_id, result, is_knockout):
     total = len(preds)
     if total > 0:
         count = Counter((p["home_goals"], p["away_goals"]) for p in preds)
+        actual_score = (result.get("home_goals"), result.get("away_goals"))
         def underdog(p):
-            return count[(p["home_goals"], p["away_goals"])] / total < 0.10
+            # Underdog bonus only applies if the prediction matches the
+            # final score EXACTLY, and fewer than 10% of players picked
+            # that exact scoreline.
+            pred_score = (p["home_goals"], p["away_goals"])
+            if pred_score != actual_score:
+                return False
+            return count[pred_score] / total < 0.10
     else:
         def underdog(_): return False
 
@@ -793,6 +823,72 @@ def auto_settle(matches):
 
         settle_match(match["id"], result, is_ko)
         mark_settle_attempted(match["id"], success=sofa_success)
+
+# ─────────────────────────────────────────────
+# RECALCULATE ALL SETTLED MATCHES
+# Re-applies the current scoring rules (e.g. the updated underdog bonus
+# logic) to every finished match by reversing and re-awarding points.
+# ─────────────────────────────────────────────
+def recalculate_all_settled_matches(matches: list) -> dict:
+    """
+    Re-settle every finished match using the current scoring rules.
+
+    For matches with a saved admin override, the override result is used.
+    Otherwise the result is rebuilt from the live score plus SofaScore's
+    first-scorer data, exactly as auto_settle() would.
+
+    Returns {"recalculated": int, "skipped": int, "total": int}.
+    """
+    ss_events = fetch_sofascore_events_for_world_cup()
+
+    finished     = [m for m in matches if m["status"] == "finished"]
+    recalculated = 0
+    skipped      = 0
+
+    for match in finished:
+        match_id = match["id"]
+        is_ko    = match["stage"] not in GROUP_STAGES
+
+        override = get_match_override(match_id)
+        if override:
+            result = {
+                "home_goals":   override["home_goals"],
+                "away_goals":   override["away_goals"],
+                "first_scorer": override["first_scorer"],
+                "first_team":   override["first_team"],
+            }
+            is_ko   = bool(override["is_knockout"])
+            sofa_ok = True
+        else:
+            first_scorer = None
+            first_team   = None
+            sofa_ok      = False
+            try:
+                ss_id = get_sofascore_id_for_match(match, ss_events)
+                if ss_id:
+                    incidents = fetch_sofascore_incidents(ss_id)
+                    first_scorer, first_team = extract_first_goal_from_incidents(incidents)
+                    sofa_ok = True
+            except Exception:
+                pass
+
+            result = {
+                "home_goals":   match["home_score"],
+                "away_goals":   match["away_score"],
+                "first_scorer": first_scorer,
+                "first_team":   first_team,
+            }
+
+        if result["home_goals"] is None or result["away_goals"] is None:
+            skipped += 1
+            continue
+
+        unsettle_match(match_id)
+        settle_match(match_id, result, is_ko)
+        mark_settle_attempted(match_id, success=sofa_ok)
+        recalculated += 1
+
+    return {"recalculated": recalculated, "skipped": skipped, "total": len(finished)}
 
 # ─────────────────────────────────────────────
 # UI — LOGIN
@@ -1306,6 +1402,47 @@ def admin_override_result():
         st.session_state["admin_page"] = "main"
         st.rerun()
 
+def admin_recalculate_all():
+    st.title("🔁 Recalculate All Settled Matches")
+    st.info(
+        "This re-applies the current scoring rules — including the updated "
+        "underdog bonus logic — to **every finished match**. For each one it "
+        "reverses the points that were previously awarded and re-scores all "
+        "predictions from scratch, using a saved admin override where one "
+        "exists, or the live result plus SofaScore's first-scorer data "
+        "otherwise."
+    )
+    st.warning(
+        "⚠️ This will change players' point totals for any match whose "
+        "original settlement awarded points under the old rules (e.g. the "
+        "old underdog bonus). A safety backup of the database is taken "
+        "automatically before this runs."
+    )
+
+    matches  = fetch_matches_fd()
+    finished = [m for m in matches if m["status"] == "finished"]
+    st.write(f"**{len(finished)}** finished match(es) found.")
+
+    confirmed = st.checkbox(
+        "I understand this will recalculate points for all finished matches"
+    )
+
+    if confirmed and st.button("🔁 Recalculate now", type="primary"):
+        with st.spinner("Recalculating all finished matches..."):
+            run_backup()
+            summary = recalculate_all_settled_matches(matches)
+        st.success(
+            f"✅ Done! Recalculated {summary['recalculated']} of "
+            f"{summary['total']} finished match(es)."
+            + (f" Skipped {summary['skipped']} (no result available)."
+               if summary["skipped"] else "")
+        )
+        st.info("Players' point totals have been updated. Reload the app to see the changes.")
+
+    if st.button("← Back"):
+        st.session_state["admin_page"] = "main"
+        st.rerun()
+
 def admin_page():
     st.title("🔧 Admin Control Panel")
 
@@ -1330,6 +1467,9 @@ def admin_page():
             st.rerun()
         if st.button("🔧 Override Match Result"):
             st.session_state["admin_page"] = "override_result"
+            st.rerun()
+        if st.button("🔁 Recalculate All Settled Matches"):
+            st.session_state["admin_page"] = "recalculate_all"
             st.rerun()
 
         st.divider()
@@ -1362,6 +1502,8 @@ def admin_page():
         admin_manual_points()
     elif page == "override_result":
         admin_override_result()
+    elif page == "recalculate_all":
+        admin_recalculate_all()
 
 def admin_view_user_predictions():
     st.title("📄 View User Predictions")
@@ -1416,17 +1558,63 @@ def admin_view_user_predictions():
 # ─────────────────────────────────────────────
 # UI — LEADERBOARD
 # ─────────────────────────────────────────────
-def leaderboard_page():
+def get_current_stage_bucket(matches: list) -> str | None:
+    """
+    Determine which stage bucket counts as the "current" round for the
+    leaderboard's booster-status column:
+      - the bucket containing the next upcoming (not-yet-kicked-off) match, or
+      - if every match has already kicked off, the bucket of the most
+        recently played match.
+    """
+    if not matches:
+        return None
+    now_utc  = datetime.now(ZoneInfo("UTC"))
+    upcoming = [m for m in matches if parse_kickoff(m["date"]) > now_utc]
+    if upcoming:
+        upcoming.sort(key=lambda m: m["date"])
+        return stage_bucket(upcoming[0])
+    latest = sorted(matches, key=lambda m: m["date"])[-1]
+    return stage_bucket(latest)
+
+def leaderboard_page(matches: list):
     st.title("🏆 Leaderboard")
-    board = get_leaderboard()
-    if not board:
+
+    conn  = get_db()
+    users = conn.execute(
+        "SELECT id, name, total_pts FROM users ORDER BY total_pts DESC"
+    ).fetchall()
+
+    if not users:
         st.info("No scores yet.")
         return
 
-    ranked = [
-        {"🏅 Rank": i, "👤 Name": r["name"], "⭐ Points": r["total_pts"]}
-        for i, r in enumerate(board, start=1)
-    ]
+    # Work out which stage bucket is "current" and collect its match IDs
+    # so we can check each user's booster status for that round.
+    current_bucket = get_current_stage_bucket(matches)
+    current_bucket_ids = []
+    if current_bucket:
+        for m in matches:
+            if stage_bucket(m) == current_bucket:
+                try:
+                    current_bucket_ids.append(int(m["id"]))
+                except (TypeError, ValueError):
+                    current_bucket_ids.append(str(m["id"]))
+
+    stage_labels = {key: lbl for key, lbl, _ in STAGE_ORDER}
+    round_label  = stage_labels.get(current_bucket, "this round")
+
+    ranked = []
+    for i, r in enumerate(users, start=1):
+        if current_bucket_ids:
+            used = booster_used_this_stage(r["id"], current_bucket_ids)
+        else:
+            used = False
+        ranked.append({
+            "🏅 Rank":  i,
+            "👤 Name":  r["name"].title(),
+            "⭐ Points": r["total_pts"],
+            f"⚡ Booster ({round_label})": "✅ Used" if used else "🟢 Available",
+        })
     st.table(ranked)
 
     if st.button("← Back"):
@@ -1484,6 +1672,38 @@ def history_page(user: dict, matches: list):
 
         st.divider()
 
+    if st.button("← Back"):
+        st.session_state["page"] = "predictions"
+        st.rerun()
+
+# ─────────────────────────────────────────────
+# UI — PROFILE / ACCOUNT SETTINGS
+# ─────────────────────────────────────────────
+def profile_page(user: dict):
+    st.title("👤 My Profile")
+
+    st.markdown(f"**Current name:** {user['name'].title()}")
+    st.markdown(f"**Total points:** {user['total_pts']}")
+
+    st.divider()
+    st.subheader("✏️ Change your name")
+    st.caption("This is the name shown on the leaderboard and in predictions.")
+
+    new_name = st.text_input("New name", key="new_username")
+
+    if st.button("Update name", key="btn_update_name", type="primary"):
+        success, msg = change_username(user["id"], new_name)
+        if success:
+            conn  = get_db()
+            fresh = conn.execute("SELECT * FROM users WHERE id=?", (user["id"],)).fetchone()
+            if fresh:
+                st.session_state["user"] = dict(fresh)
+            st.success(msg)
+            st.rerun()
+        else:
+            st.error(msg)
+
+    st.divider()
     if st.button("← Back"):
         st.session_state["page"] = "predictions"
         st.rerun()
@@ -2011,6 +2231,10 @@ def main():
         st.session_state["page"] = "history"
         st.rerun()
 
+    if st.sidebar.button("👤 Profile"):
+        st.session_state["page"] = "profile"
+        st.rerun()
+
     if st.sidebar.button("Log out"):
         st.session_state.pop("user", None)
         st.session_state["page"] = "predictions"
@@ -2019,11 +2243,13 @@ def main():
     page = st.session_state.get("page", "predictions")
 
     if page == "leaderboard":
-        leaderboard_page()
+        leaderboard_page(matches)
     elif page == "history":
         history_page(user, matches)
     elif page == "match_centre":
         match_centre_page(matches, user)
+    elif page == "profile":
+        profile_page(user)
     else:
         predictions_page(user, matches)
 
@@ -2031,4 +2257,3 @@ if __name__ == "__main__":
     main()
 
 # ─────────────────────────────────────────────
-
