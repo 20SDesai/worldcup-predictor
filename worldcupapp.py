@@ -4,8 +4,10 @@ import requests
 import random
 import json
 from datetime import datetime, timedelta
-from collections import Counter
+from collections import Counter, defaultdict
 from zoneinfo import ZoneInfo
+import hashlib
+import os
 
 # ─────────────────────────────────────────────
 # CONFIG
@@ -23,6 +25,9 @@ HEADERS_FD  = {"X-Auth-Token": API_TOKEN_FD}
 LEAGUE_CODE = "WC2026"
 ADMIN_PIN   = "9999"
 
+# Session cookie duration (24 hours)
+SESSION_DURATION_HOURS = 24
+
 GROUP_STAGES = {"group", "group stage", "group_stage", ""}
 
 # Maps each match to one of 8 bonus buckets (one booster allowed per bucket).
@@ -34,18 +39,14 @@ def stage_bucket(match: dict) -> str:
     """
     stage = (match.get("stage") or "").lower().strip()
     if stage in GROUP_STAGES:
-        # matchday field holds the round number inside the group stage
         md = str(match.get("matchday") or "").strip()
-        # football-data can return "1", "2", "3" or descriptive strings
         if md in ("1", "2", "3"):
             return f"group_round_{md}"
-        # Fallback: try to extract a digit from the matchday string
         import re
         digits = re.findall(r"\d+", md)
         if digits:
             return f"group_round_{digits[0]}"
         return "group_round_1"
-    # Normalise knockout stage names
     stage_map = {
         "round of 32":   "round_of_32",
         "round_of_32":   "round_of_32",
@@ -57,10 +58,17 @@ def stage_bucket(match: dict) -> str:
         "quarter-final": "quarterfinal",
         "quarterfinal":  "quarterfinal",
         "quarter final": "quarterfinal",
+        "quarter-finals": "quarterfinal",
+        "quarter_finals": "quarterfinal",
         "semi_final":    "semifinal",
         "semi-final":    "semifinal",
         "semifinal":     "semifinal",
         "semi final":    "semifinal",
+        "semi-finals":   "semifinal",
+        "semi_finals":   "semifinal",
+        "third_place":   "third_place",
+        "third place":   "third_place",
+        "3rd place":     "third_place",
         "final":         "final",
     }
     return stage_map.get(stage, stage)
@@ -88,10 +96,11 @@ def init_db():
     conn = get_db()
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS users (
-            id        INTEGER PRIMARY KEY AUTOINCREMENT,
-            name      TEXT    UNIQUE NOT NULL,
-            pin       TEXT    NOT NULL,
-            total_pts INTEGER DEFAULT 0
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            name          TEXT    UNIQUE NOT NULL,
+            pin           TEXT    NOT NULL,
+            total_pts     INTEGER DEFAULT 0,
+            league_verified INTEGER DEFAULT 0
         );
 
         CREATE TABLE IF NOT EXISTS predictions (
@@ -130,40 +139,86 @@ def init_db():
             override_ts   TEXT    DEFAULT (datetime('now')),
             reason        TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS user_sessions (
+            session_token TEXT PRIMARY KEY,
+            user_id       INTEGER NOT NULL,
+            created_at    TEXT    NOT NULL,
+            expires_at    TEXT    NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        );
     """)
     conn.commit()
 
-    # Migration: add points_breakdown column if it doesn't already exist
-    # (older databases were created before this feature was added).
-    try:
-        conn.execute("ALTER TABLE predictions ADD COLUMN points_breakdown TEXT")
-        conn.commit()
-    except sqlite3.OperationalError:
-        pass  # column already exists
+    # Migration: add columns if they don't already exist
+    migrations = [
+        ("predictions", "points_breakdown", "TEXT"),
+        ("users", "league_verified", "INTEGER DEFAULT 0"),
+    ]
+    for table, column, col_type in migrations:
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_type}")
+            conn.commit()
+        except sqlite3.OperationalError:
+            pass  # column already exists
 
 init_db()
 
 # ─────────────────────────────────────────────
-# AUTO BACKUP
-# Runs once per session (stored in session_state). Copies the live DB to
-# backups/worldcup_YYYYMMDD_HHMMSS.db — keeps the 10 most recent files
-# so the folder never grows unbounded.
+# SESSION MANAGEMENT (24-hour persistent login)
 # ─────────────────────────────────────────────
-import shutil, glob, os
+def generate_session_token() -> str:
+    return hashlib.sha256(os.urandom(32)).hexdigest()
+
+def create_session(user_id: int) -> str:
+    conn = get_db()
+    token = generate_session_token()
+    now = datetime.utcnow()
+    expires = now + timedelta(hours=SESSION_DURATION_HOURS)
+    conn.execute(
+        "INSERT INTO user_sessions (session_token, user_id, created_at, expires_at) VALUES (?,?,?,?)",
+        (token, user_id, now.isoformat(), expires.isoformat())
+    )
+    conn.commit()
+    return token
+
+def get_user_from_session(token: str) -> dict | None:
+    if not token:
+        return None
+    conn = get_db()
+    row = conn.execute(
+        """SELECT u.* FROM users u
+           JOIN user_sessions s ON s.user_id = u.id
+           WHERE s.session_token = ? AND s.expires_at > ?""",
+        (token, datetime.utcnow().isoformat())
+    ).fetchone()
+    return dict(row) if row else None
+
+def delete_session(token: str):
+    conn = get_db()
+    conn.execute("DELETE FROM user_sessions WHERE session_token=?", (token,))
+    conn.commit()
+
+def cleanup_expired_sessions():
+    conn = get_db()
+    conn.execute("DELETE FROM user_sessions WHERE expires_at < ?", (datetime.utcnow().isoformat(),))
+    conn.commit()
+
+# ─────────────────────────────────────────────
+# AUTO BACKUP
+# ─────────────────────────────────────────────
+import shutil, glob
 
 BACKUP_DIR      = "backups"
-BACKUP_KEEP     = 10          # number of recent backups to retain
-BACKUP_INTERVAL = 3600        # seconds between backups within the same session
+BACKUP_KEEP     = 10
+BACKUP_INTERVAL = 3600
 
 def run_backup():
-    """Write a timestamped copy of the DB, then prune old ones."""
     try:
         os.makedirs(BACKUP_DIR, exist_ok=True)
-        ts       = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-        dst      = os.path.join(BACKUP_DIR, f"worldcup_{ts}.db")
+        ts  = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        dst = os.path.join(BACKUP_DIR, f"worldcup_{ts}.db")
         shutil.copy2(DB_PATH, dst)
-
-        # Prune: keep only the N most recent backups
         backups = sorted(glob.glob(os.path.join(BACKUP_DIR, "worldcup_*.db")))
         for old in backups[:-BACKUP_KEEP]:
             try:
@@ -171,13 +226,9 @@ def run_backup():
             except OSError:
                 pass
     except Exception:
-        pass   # never crash the app over a backup failure
+        pass
 
 def maybe_backup():
-    """
-    Called once per page load. Throttled by BACKUP_INTERVAL so we don't
-    hammer the disk on every Streamlit rerun.
-    """
     now = datetime.utcnow().timestamp()
     last = st.session_state.get("last_backup_ts", 0)
     if now - last >= BACKUP_INTERVAL:
@@ -188,7 +239,6 @@ def maybe_backup():
 # AUTH HELPERS
 # ─────────────────────────────────────────────
 def get_or_create_user(name: str, pin: str):
-    """Legacy helper kept for invite-link flows."""
     conn       = get_db()
     clean_name = name.strip().lower()
     existing   = conn.execute("SELECT * FROM users WHERE name=?", (clean_name,)).fetchone()
@@ -208,28 +258,21 @@ def verify_user(name: str, pin: str):
     ).fetchone()
     return dict(user) if user else None
 
-def register_user(name: str, pin: str):
-    """
-    Create a brand-new account.
-    Returns (user_dict, None) on success.
-    Returns (None, error_message) if the name is already taken.
-    """
+def register_user(name: str, pin: str, league_verified: bool = False):
     conn       = get_db()
     clean_name = name.strip().lower()
     existing   = conn.execute("SELECT id FROM users WHERE name=?", (clean_name,)).fetchone()
     if existing:
         return None, "That name is already registered. Please log in instead."
-    conn.execute("INSERT INTO users (name, pin) VALUES (?, ?)", (clean_name, pin))
+    conn.execute(
+        "INSERT INTO users (name, pin, league_verified) VALUES (?, ?, ?)",
+        (clean_name, pin, 1 if league_verified else 0)
+    )
     conn.commit()
     user = conn.execute("SELECT * FROM users WHERE name=?", (clean_name,)).fetchone()
     return dict(user), None
 
 def login_user(name: str, pin: str):
-    """
-    Log in to an existing account.
-    Returns (user_dict, None) on success.
-    Returns (None, error_message) if name not found or PIN wrong.
-    """
     conn       = get_db()
     clean_name = name.strip().lower()
     existing   = conn.execute("SELECT * FROM users WHERE name=?", (clean_name,)).fetchone()
@@ -239,11 +282,12 @@ def login_user(name: str, pin: str):
         return None, "Incorrect PIN."
     return dict(existing), None
 
+def mark_league_verified(user_id: int):
+    conn = get_db()
+    conn.execute("UPDATE users SET league_verified=1 WHERE id=?", (user_id,))
+    conn.commit()
+
 def change_username(user_id: int, new_name: str):
-    """
-    Rename a user's account.
-    Returns (success: bool, message: str).
-    """
     conn       = get_db()
     clean_name = new_name.strip().lower()
 
@@ -290,7 +334,11 @@ def _normalise_match_fd(m: dict) -> dict:
         status = "scheduled"
 
     stage_raw = (m.get("stage") or "GROUP_STAGE").upper()
-    stage = "group" if stage_raw in ("GROUP_STAGE", "GROUP STAGE", "") else stage_raw.lower()
+    if stage_raw in ("GROUP_STAGE", "GROUP STAGE", ""):
+        stage = "group"
+    else:
+        # Normalize knockout stage names
+        stage = stage_raw.lower().replace("_", " ").replace("-", " ")
 
     return {
         "id":            str(m["id"]),
@@ -318,6 +366,9 @@ def fetch_matches_fd() -> list:
     if not API_TOKEN_FD or API_TOKEN_FD == "YOUR_FOOTBALL_DATA_API_TOKEN_HERE":
         st.warning("⚠️ No football-data.org API token set.")
         return []
+    if not API_BASE_FD.startswith("http"):
+        st.error(f"Invalid football-data base URL: {API_BASE_FD}")
+        return []
     try:
         r = requests.get(
             f"{API_BASE_FD}/competitions/{COMPETITION}/matches",
@@ -327,13 +378,18 @@ def fetch_matches_fd() -> list:
         r.raise_for_status()
         raw = r.json().get("matches", [])
         return [_normalise_match_fd(m) for m in raw]
-    except Exception as e:
+    except requests.exceptions.RequestException as e:
         st.error(f"Could not fetch matches: {e}")
+        return []
+    except Exception as e:
+        st.error(f"Unexpected error while fetching matches: {e}")
         return []
 
 @st.cache_data(ttl=300)
 def fetch_standings_fd() -> list:
-    """Fetch group-stage standings table."""
+    if not API_BASE_FD.startswith("http"):
+        st.error(f"Invalid football-data base URL: {API_BASE_FD}")
+        return []
     try:
         r = requests.get(
             f"{API_BASE_FD}/competitions/{COMPETITION}/standings",
@@ -342,6 +398,8 @@ def fetch_standings_fd() -> list:
         )
         r.raise_for_status()
         return r.json().get("standings", [])
+    except requests.exceptions.RequestException:
+        return []
     except Exception:
         return []
 
@@ -352,12 +410,16 @@ def fetch_standings_fd() -> list:
 def fetch_team_squad(team_id: int) -> list:
     if not team_id:
         return []
+    if not API_BASE_FD.startswith("http"):
+        return []
     try:
         url = f"{API_BASE_FD}/teams/{team_id}"
         r   = requests.get(url, headers=HEADERS_FD, timeout=10)
         r.raise_for_status()
         squad = r.json().get("squad", [])
         return [p.get("name") for p in squad if p.get("name")]
+    except requests.exceptions.RequestException:
+        return []
     except Exception:
         return []
 
@@ -365,15 +427,14 @@ def fetch_team_squad(team_id: int) -> list:
 # SOFASCORE HELPERS
 # ─────────────────────────────────────────────
 def _sofa_get(url: str, timeout: int = 10):
-    # SofaScore is an unofficial API — failures are expected and handled
-    # silently so users never see confusing 403/timeout messages.
     try:
         r = requests.get(url, timeout=timeout)
         r.raise_for_status()
         return r.json()
+    except requests.exceptions.RequestException:
+        return None
     except Exception:
-        pass
-    return None
+        return None
 
 @st.cache_data(ttl=3600)
 def get_latest_world_cup_season_id() -> int | None:
@@ -482,19 +543,13 @@ def fetch_sofascore_incidents(sofascore_id: int) -> list:
 
 @st.cache_data(ttl=60)
 def fetch_sofascore_live_details(sofascore_id: int) -> dict:
-    """
-    Fetch live match details from SofaScore: current minute, incidents
-    (goals, cards, substitutions). Returns a dict with keys:
-        minute, period, incidents
-    Returns empty dict on failure — callers must handle gracefully.
-    """
     data = _sofa_get(f"{API_BASE_SOFA}/event/{sofascore_id}")
     if not data:
         return {}
     ev = data.get("event", {})
     status  = ev.get("status", {})
-    minute  = status.get("description", "")   # e.g. "45+2", "67"
-    period  = status.get("type", "")          # "inprogress", "finished" etc.
+    minute  = status.get("description", "")
+    period  = status.get("type", "")
     incidents_data = _sofa_get(f"{API_BASE_SOFA}/event/{sofascore_id}/incidents") or {}
     incidents = incidents_data.get("incidents", [])
     return {"minute": minute, "period": period, "incidents": incidents}
@@ -516,14 +571,6 @@ def extract_first_goal_from_incidents(incidents: list):
     return player, team
 
 def parse_incidents(incidents: list, home_team: str, away_team: str) -> dict:
-    """
-    Split raw SofaScore incidents into structured lists for the match centre.
-    Returns:
-        goals        — list of {minute, player, team, is_penalty, is_own_goal}
-        yellow_cards — list of {minute, player, team}
-        red_cards    — list of {minute, player, team}
-        subs         — list of {minute, player_in, player_out, team}
-    """
     goals = []
     yellow_cards = []
     red_cards = []
@@ -602,15 +649,6 @@ def score_prediction(pred, result, is_knockout):
     return points
 
 def build_points_breakdown(pred, result, is_knockout, underdog_bonus=False):
-    """
-    Returns a list of {"label": str, "points": int} items describing exactly
-    how a prediction's final point total was made up. Mirrors the rules
-    applied in settle_match(), including the underdog bonus and booster
-    doubling — so summing the "points" values always equals the
-    prediction's final stored `points`.
-
-    Returns an empty list if the result is incomplete (nothing to score yet).
-    """
     parts = []
     ph = pred.get("home_goals")
     pa = pred.get("away_goals")
@@ -656,7 +694,6 @@ def settle_match(match_id, result, is_knockout):
     if already:
         return
 
-    # Apply admin override if one exists for this match
     override = get_match_override(match_id)
     if override:
         result = {
@@ -676,9 +713,6 @@ def settle_match(match_id, result, is_knockout):
         count = Counter((p["home_goals"], p["away_goals"]) for p in preds)
         actual_score = (result.get("home_goals"), result.get("away_goals"))
         def underdog(p):
-            # Underdog bonus only applies if the prediction matches the
-            # final score EXACTLY, and fewer than 10% of players picked
-            # that exact scoreline.
             pred_score = (p["home_goals"], p["away_goals"])
             if pred_score != actual_score:
                 return False
@@ -726,7 +760,6 @@ def mark_settle_attempted(match_id: str, success: bool):
     conn.commit()
 
 def get_match_override(match_id: str):
-    """Return the admin-overridden result for a match, or None."""
     conn = get_db()
     row  = conn.execute(
         "SELECT * FROM match_overrides WHERE match_id=?", (str(match_id),)
@@ -734,11 +767,6 @@ def get_match_override(match_id: str):
     return dict(row) if row else None
 
 def unsettle_match(match_id):
-    """
-    Reverse a previous settlement so the match can be re-scored.
-    Deducts the points that were awarded during the original settlement
-    then clears settled=1 so settle_match() can run again cleanly.
-    """
     conn  = get_db()
     preds = conn.execute(
         "SELECT * FROM predictions WHERE match_id=? AND settled=1", (str(match_id),)
@@ -751,7 +779,6 @@ def unsettle_match(match_id):
         conn.execute(
             "UPDATE predictions SET points=0, points_breakdown=NULL, settled=0 WHERE id=?", (p["id"],)
         )
-    # Remove the settle_log entry so settle_match won't short-circuit
     conn.execute("DELETE FROM settle_log WHERE match_id=?", (str(match_id),))
     conn.commit()
 
@@ -785,19 +812,10 @@ def get_prediction(user_id, match_id):
     return dict(row) if row else None
 
 def booster_used_this_matchday(user_id, matchday_match_ids, exclude_match_id=None):
-    """Legacy alias kept for backward compatibility."""
     return booster_used_this_stage(user_id, matchday_match_ids, exclude_match_id)
 
 def booster_used_this_stage(user_id: int, stage_match_ids: list, exclude_match_id=None) -> bool:
-    """
-    Returns True if the user has already used their booster on any match
-    in the same stage bucket (excluding the current match being rendered).
-    One booster is allowed per stage bucket:
-        group_round_1, group_round_2, group_round_3,
-        round_of_32, round_of_16, quarterfinal, semifinal, final
-    """
     conn = get_db()
-    # Normalise all IDs to the same type to avoid sqlite3.InterfaceError
     def _norm(v):
         try:
             return int(v)
@@ -829,9 +847,69 @@ def get_leaderboard():
     ).fetchall()
     return [dict(r) for r in rows]
 
+def get_leaderboard_with_round_points(matches: list) -> list:
+    """
+    Returns leaderboard data with per-round points breakdown.
+    Each entry contains: user_id, name, total_pts, and a dict of round_points.
+    """
+    conn = get_db()
+    users = conn.execute(
+        "SELECT id, name, total_pts FROM users ORDER BY total_pts DESC"
+    ).fetchall()
+
+    # Build match_id -> stage_bucket mapping
+    match_to_bucket = {str(m["id"]): stage_bucket(m) for m in matches}
+    # Also track which matches are finished
+    finished_match_ids = {str(m["id"]) for m in matches if m["status"] == "finished"}
+
+    result = []
+    for user in users:
+        user_id = user["id"]
+        # Get all settled predictions for this user
+        preds = conn.execute(
+            """SELECT match_id, points, booster_used, settled
+               FROM predictions WHERE user_id=? AND settled=1""",
+            (user_id,)
+        ).fetchall()
+
+        round_points = defaultdict(int)
+        round_booster_used = defaultdict(bool)
+
+        for p in preds:
+            match_id = str(p["match_id"])
+            bucket = match_to_bucket.get(match_id, "unknown")
+            round_points[bucket] += p["points"]
+            if p["booster_used"]:
+                round_booster_used[bucket] = True
+
+        # Also check for booster usage on unsettled predictions (match played but not settled)
+        unsettled_preds = conn.execute(
+            """SELECT match_id, booster_used FROM predictions 
+               WHERE user_id=? AND settled=0""",
+            (user_id,)
+        ).fetchall()
+
+        for p in unsettled_preds:
+            match_id = str(p["match_id"])
+            # Only count as "used" if the match has finished
+            if match_id in finished_match_ids and p["booster_used"]:
+                bucket = match_to_bucket.get(match_id, "unknown")
+                round_booster_used[bucket] = True
+
+        result.append({
+            "user_id": user_id,
+            "name": user["name"],
+            "total_pts": user["total_pts"],
+            "round_points": dict(round_points),
+            "round_booster_used": dict(round_booster_used),
+        })
+
+    return result
+
 def delete_user(user_id: int):
     conn = get_db()
     conn.execute("DELETE FROM predictions WHERE user_id=?", (user_id,))
+    conn.execute("DELETE FROM user_sessions WHERE user_id=?", (user_id,))
     conn.execute("DELETE FROM users WHERE id=?", (user_id,))
     conn.commit()
 
@@ -885,19 +963,8 @@ def auto_settle(matches):
 
 # ─────────────────────────────────────────────
 # RECALCULATE ALL SETTLED MATCHES
-# Re-applies the current scoring rules (e.g. the updated underdog bonus
-# logic) to every finished match by reversing and re-awarding points.
 # ─────────────────────────────────────────────
 def recalculate_all_settled_matches(matches: list) -> dict:
-    """
-    Re-settle every finished match using the current scoring rules.
-
-    For matches with a saved admin override, the override result is used.
-    Otherwise the result is rebuilt from the live score plus SofaScore's
-    first-scorer data, exactly as auto_settle() would.
-
-    Returns {"recalculated": int, "skipped": int, "total": int}.
-    """
     ss_events = fetch_sofascore_events_for_world_cup()
 
     finished     = [m for m in matches if m["status"] == "finished"]
@@ -955,44 +1022,73 @@ def recalculate_all_settled_matches(matches: list) -> dict:
 def login_page():
     st.title("⚽ World Cup 2026 Predictor")
 
-    # ── Invite-link auto-login (query params) ──────────────────────────────
+    # Check for existing session
+    session_token = st.session_state.get("session_token")
+    if session_token:
+        user = get_user_from_session(session_token)
+        if user:
+            st.session_state["user"] = user
+            st.session_state["page"] = "predictions"
+            st.rerun()
+
+    # Invite-link auto-login
     params       = st.query_params
     default_name = params.get("user", "")
     default_pin  = params.get("pin", "")
     if default_name and default_pin:
         user = verify_user(default_name, default_pin)
         if user:
+            token = create_session(user["id"])
+            st.session_state["session_token"] = token
             st.session_state["user"] = user
             st.session_state["page"] = "predictions"
             st.rerun()
 
-    # ── Tab switcher ────────────────────────────────────────────────────────
     tab_login, tab_register, tab_admin = st.tabs(["🔑 Login", "📝 Register", "🔧 Admin"])
 
-    # ── LOGIN ───────────────────────────────────────────────────────────────
     with tab_login:
         st.subheader("Welcome back")
         l_name   = st.text_input("Your name", key="login_name")
         l_pin    = st.text_input("PIN (4 digits)", max_chars=4, type="password", key="login_pin")
-        l_league = st.text_input("League code", type="password", key="login_league")
+
+        # Check if user needs league code
+        conn = get_db()
+        existing_user = None
+        if l_name.strip():
+            existing_user = conn.execute(
+                "SELECT * FROM users WHERE name=?", (l_name.strip().lower(),)
+            ).fetchone()
+
+        needs_league = True
+        if existing_user and existing_user["league_verified"]:
+            needs_league = False
+
+        if needs_league:
+            l_league = st.text_input("League code", type="password", key="login_league")
+        else:
+            l_league = LEAGUE_CODE  # Skip verification
 
         if st.button("Login", key="btn_login", type="primary"):
             if not l_name:
                 st.error("Please enter your name.")
             elif not l_pin.isdigit() or len(l_pin) != 4:
                 st.error("PIN must be exactly 4 digits.")
-            elif l_league != LEAGUE_CODE:
+            elif needs_league and l_league != LEAGUE_CODE:
                 st.error("Incorrect league code.")
             else:
                 user, err = login_user(l_name, l_pin)
                 if err:
                     st.error(err)
                 else:
+                    # Mark league as verified if this was first successful login with code
+                    if needs_league:
+                        mark_league_verified(user["id"])
+                    token = create_session(user["id"])
+                    st.session_state["session_token"] = token
                     st.session_state["user"] = user
                     st.session_state["page"] = "predictions"
                     st.rerun()
 
-    # ── REGISTER ────────────────────────────────────────────────────────────
     with tab_register:
         st.subheader("Create an account")
         r_name    = st.text_input("Choose a name", key="reg_name")
@@ -1010,16 +1106,17 @@ def login_page():
             elif r_league != LEAGUE_CODE:
                 st.error("Incorrect league code.")
             else:
-                user, err = register_user(r_name, r_pin)
+                user, err = register_user(r_name, r_pin, league_verified=True)
                 if err:
                     st.error(err)
                 else:
                     st.success(f"Account created! Welcome, {user['name'].title()} 🎉")
+                    token = create_session(user["id"])
+                    st.session_state["session_token"] = token
                     st.session_state["user"] = user
                     st.session_state["page"] = "predictions"
                     st.rerun()
 
-    # ── ADMIN ────────────────────────────────────────────────────────────────
     with tab_admin:
         st.subheader("Admin access")
         if st.session_state.get("awaiting_admin_pin"):
@@ -1153,12 +1250,10 @@ def admin_manual_points():
             st.rerun()
         return
 
-    # ── Step 1: pick a user ────────────────────────────────────────────────
     user_labels = {f"{u['name'].title()} (ID {u['id']}, {u['total_pts']} pts)": u for u in users}
     chosen_label = st.selectbox("Select player", list(user_labels.keys()))
     chosen_user  = user_labels[chosen_label]
 
-    # ── Step 2: pick a match from that user's settled predictions ──────────
     preds = conn.execute(
         """SELECT p.id, p.match_id, p.home_goals, p.away_goals,
                   p.points, p.booster_used, p.settled
@@ -1186,7 +1281,6 @@ def admin_manual_points():
     st.markdown("---")
     st.markdown(f"**Current points for this prediction:** `{chosen_pred['points']}`")
 
-    # ── Step 3: enter correction ───────────────────────────────────────────
     col_a, col_b = st.columns(2)
     with col_a:
         new_pts = st.number_input(
@@ -1218,17 +1312,14 @@ def admin_manual_points():
             st.error("Please enter a reason before applying.")
         else:
             try:
-                # Update the prediction row
                 conn.execute(
                     "UPDATE predictions SET points = ? WHERE id = ?",
                     (new_pts, chosen_pred["id"])
                 )
-                # Adjust the user's total by the delta only
                 conn.execute(
                     "UPDATE users SET total_pts = total_pts + ? WHERE id = ?",
                     (delta, chosen_user["id"])
                 )
-                # Write to audit log table (create if not exists)
                 conn.execute("""
                     CREATE TABLE IF NOT EXISTS points_audit (
                         id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1268,7 +1359,6 @@ def admin_manual_points():
 
     st.divider()
 
-    # ── Audit log viewer ───────────────────────────────────────────────────
     with st.expander("📋 View points audit log"):
         try:
             log = conn.execute(
@@ -1313,7 +1403,6 @@ def admin_override_result():
             st.rerun()
         return
 
-    # Build display labels
     def _mlabel(m):
         ko = parse_kickoff(m["date"])
         date_str = display_time(ko)
@@ -1325,7 +1414,6 @@ def admin_override_result():
     mid          = str(chosen_match["id"])
     is_ko        = (chosen_match.get("stage", "").lower() not in GROUP_STAGES)
 
-    # Pre-fill from existing override or API result
     existing_override = get_match_override(mid)
     api_home = chosen_match.get("home_goals") or 0
     api_away = chosen_match.get("away_goals") or 0
@@ -1444,7 +1532,6 @@ def admin_override_result():
                 st.success("✅ Re-settle complete! All predictions rescored against the corrected result.")
                 st.rerun()
 
-    # ── Saved overrides log ───────────────────────────────────────────────
     with st.expander("📋 All saved overrides"):
         rows = conn.execute(
             "SELECT * FROM match_overrides ORDER BY override_ts DESC"
@@ -1618,13 +1705,6 @@ def admin_view_user_predictions():
 # UI — LEADERBOARD
 # ─────────────────────────────────────────────
 def get_current_stage_bucket(matches: list) -> str | None:
-    """
-    Determine which stage bucket counts as the "current" round for the
-    leaderboard's booster-status column:
-      - the bucket containing the next upcoming (not-yet-kicked-off) match, or
-      - if every match has already kicked off, the bucket of the most
-        recently played match.
-    """
     if not matches:
         return None
     now_utc  = datetime.now(ZoneInfo("UTC"))
@@ -1635,46 +1715,66 @@ def get_current_stage_bucket(matches: list) -> str | None:
     latest = sorted(matches, key=lambda m: m["date"])[-1]
     return stage_bucket(latest)
 
+def get_played_stage_buckets(matches: list) -> set:
+    """Return set of stage buckets that have at least one finished match."""
+    played = set()
+    for m in matches:
+        if m["status"] == "finished":
+            played.add(stage_bucket(m))
+    return played
+
 def leaderboard_page(matches: list):
     st.title("🏆 Leaderboard")
 
-    conn  = get_db()
-    users = conn.execute(
-        "SELECT id, name, total_pts FROM users ORDER BY total_pts DESC"
-    ).fetchall()
+    leaderboard_data = get_leaderboard_with_round_points(matches)
 
-    if not users:
+    if not leaderboard_data:
         st.info("No scores yet.")
         return
 
-    # Work out which stage bucket is "current" and collect its match IDs
-    # so we can check each user's booster status for that round.
-    current_bucket = get_current_stage_bucket(matches)
-    current_bucket_ids = []
-    if current_bucket:
-        for m in matches:
-            if stage_bucket(m) == current_bucket:
-                try:
-                    current_bucket_ids.append(int(m["id"]))
-                except (TypeError, ValueError):
-                    current_bucket_ids.append(str(m["id"]))
+    # Determine which rounds have been played (for booster display)
+    played_buckets = get_played_stage_buckets(matches)
 
+    # Build column headers dynamically based on rounds with points
     stage_labels = {key: lbl for key, lbl, _ in STAGE_ORDER}
-    round_label  = stage_labels.get(current_bucket, "this round")
 
-    ranked = []
-    for i, r in enumerate(users, start=1):
-        if current_bucket_ids:
-            used = booster_used_this_stage(r["id"], current_bucket_ids)
-        else:
-            used = False
-        ranked.append({
-            "🏅 Rank":  i,
-            "👤 Name":  r["name"].title(),
-            "⭐ Points": r["total_pts"],
-            f"⚡ Booster ({round_label})": "✅ Used" if used else "🟢 Available",
-        })
-    st.table(ranked)
+    # Find all rounds that have any points
+    all_rounds_with_points = set()
+    for entry in leaderboard_data:
+        all_rounds_with_points.update(entry["round_points"].keys())
+
+    # Order rounds according to STAGE_ORDER
+    ordered_rounds = [key for key, _, _ in STAGE_ORDER if key in all_rounds_with_points]
+
+    # Build table rows
+    rows = []
+    for i, entry in enumerate(leaderboard_data, start=1):
+        row = {
+            "🏅 Rank": i,
+            "👤 Name": entry["name"].title(),
+            "⭐ Total": entry["total_pts"],
+        }
+
+        # Add per-round points
+        for round_key in ordered_rounds:
+            round_label = stage_labels.get(round_key, round_key.replace("_", " ").title())
+            pts = entry["round_points"].get(round_key, 0)
+            row[f"📊 {round_label}"] = pts
+
+        # Add booster status for each played round
+        for round_key in ordered_rounds:
+            if round_key in played_buckets:
+                round_label = stage_labels.get(round_key, round_key.replace("_", " ").title())
+                used = entry["round_booster_used"].get(round_key, False)
+                row[f"⚡ {round_label}"] = "✅" if used else "🟢"
+
+        rows.append(row)
+
+    st.table(rows)
+
+    # Legend
+    st.caption("⚡ Booster columns only show for rounds where at least one match has been played.")
+    st.caption("✅ = Booster used  |  🟢 = Booster available")
 
     if st.button("← Back"):
         st.session_state["page"] = "predictions"
@@ -1684,11 +1784,6 @@ def leaderboard_page(matches: list):
 # UI — POINTS BREAKDOWN HELPER
 # ─────────────────────────────────────────────
 def _render_points_breakdown(pred_row: dict):
-    """
-    Render an expander showing exactly how a settled prediction's points
-    were earned. `pred_row` must contain "points" and "points_breakdown"
-    (a JSON-encoded list produced by build_points_breakdown()).
-    """
     try:
         breakdown = json.loads(pred_row.get("points_breakdown") or "[]")
     except (TypeError, ValueError):
@@ -1743,7 +1838,8 @@ def history_page(user: dict, matches: list):
             st.caption(display_time(parse_kickoff(m["date"])))
         with col2:
             booster_tag = " ⚡2x" if h["booster_used"] else ""
-            st.markdown(f"Your prediction: **{h['home_goals']} – {h['away_goals']}**{booster_tag}")
+            pts_txt = f"  •  **{h['points']} pts**" if h["settled"] else ""
+            st.markdown(f"Your pick: {h['home_goals']} – {h['away_goals']}{booster_tag}{pts_txt}")
             st.markdown(
                 f"Actual: **{actual_h} – {actual_a}**"
                 if actual_h is not None else "Actual: TBC"
@@ -1806,12 +1902,10 @@ def match_centre_page(matches: list, user: dict):
 
     now_utc = datetime.now(ZoneInfo("UTC"))
 
-    # ── tab layout ───────────────────────────
     tab_live, tab_today, tab_results, tab_fixtures, tab_standings = st.tabs([
         "🔴 Live", "📅 Today", "✅ Results", "🗓️ Fixtures", "📊 Standings"
     ])
 
-    # ── helper: render one match card ────────
     def _match_card(m: dict, show_incidents: bool = False):
         kickoff  = parse_kickoff(m["date"])
         is_ko    = m["stage"] not in GROUP_STAGES
@@ -1819,15 +1913,12 @@ def match_centre_page(matches: list, user: dict):
         if m.get("group"):
             stage_lbl = m["group"]
 
-        # outer container
         with st.container():
-            # header row: stage label + venue
             meta_parts = [stage_lbl]
             if m.get("venue"):
                 meta_parts.append(m["venue"])
             st.caption(" · ".join(meta_parts))
 
-            # score / time row
             c_home, c_score, c_away = st.columns([4, 3, 4])
 
             with c_home:
@@ -1876,11 +1967,9 @@ def match_centre_page(matches: list, user: dict):
                     st.image(crest, width=40)
                 st.markdown(f"**{m['away_team']}**")
 
-            # referee
             if m.get("referee"):
                 st.caption(f"🟨 Referee: {m['referee']}")
 
-            # user's prediction badge
             if user:
                 pred = get_prediction(user["id"], m["id"])
                 if pred and pred["home_goals"] is not None:
@@ -1894,7 +1983,6 @@ def match_centre_page(matches: list, user: dict):
                     if is_locked(kickoff):
                         st.warning("No prediction submitted.")
 
-            # ── incidents (goals / cards / subs) ──
             if show_incidents and m["status"] in ("live", "finished"):
                 ss_events = fetch_sofascore_events_for_world_cup()
                 ss_id     = get_sofascore_id_for_match(m, ss_events)
@@ -1932,7 +2020,6 @@ def match_centre_page(matches: list, user: dict):
 
             st.divider()
 
-    # ── LIVE TAB ─────────────────────────────
     with tab_live:
         live = [m for m in matches if m["status"] == "live"]
         if not live:
@@ -1942,7 +2029,6 @@ def match_centre_page(matches: list, user: dict):
             for m in live:
                 _match_card(m, show_incidents=True)
 
-    # ── TODAY TAB ────────────────────────────
     with tab_today:
         today_uk = datetime.now(UK_TZ).date()
         today_matches = [
@@ -1955,13 +2041,11 @@ def match_centre_page(matches: list, user: dict):
             for m in sorted(today_matches, key=lambda x: x["date"]):
                 _match_card(m, show_incidents=(m["status"] in ("live", "finished")))
 
-    # ── RESULTS TAB ──────────────────────────
     with tab_results:
         finished = [m for m in matches if m["status"] == "finished"]
         if not finished:
             st.info("No results yet.")
         else:
-            # Group by date (UK)
             by_date: dict = {}
             for m in finished:
                 d = parse_kickoff(m["date"]).astimezone(UK_TZ).strftime("%A %d %b %Y")
@@ -1972,21 +2056,18 @@ def match_centre_page(matches: list, user: dict):
                     for m in sorted(by_date[date_label], key=lambda x: x["date"]):
                         _match_card(m, show_incidents=True)
 
-    # ── FIXTURES TAB ─────────────────────────
     with tab_fixtures:
         upcoming = [m for m in matches if m["status"] == "scheduled"]
         if not upcoming:
             st.info("No upcoming fixtures.")
         else:
-            # Key by ISO date string (YYYY-MM-DD) so sorting is chronological,
-            # then display the human-readable label separately.
-            by_date: dict = {}   # "2026-06-12" -> list of matches
+            by_date: dict = {}
             for m in upcoming:
                 iso_day = parse_kickoff(m["date"]).astimezone(UK_TZ).strftime("%Y-%m-%d")
                 by_date.setdefault(iso_day, []).append(m)
 
-            sorted_iso_dates = sorted(by_date.keys())          # correct chrono order
-            near_dates       = set(sorted_iso_dates[:7])       # first 7 days expanded
+            sorted_iso_dates = sorted(by_date.keys())
+            near_dates       = set(sorted_iso_dates[:7])
 
             for iso_day in sorted_iso_dates:
                 display_label = datetime.strptime(iso_day, "%Y-%m-%d").strftime("%A %d %b %Y")
@@ -1995,13 +2076,11 @@ def match_centre_page(matches: list, user: dict):
                     for m in sorted(by_date[iso_day], key=lambda x: x["date"]):
                         _match_card(m, show_incidents=False)
 
-    # ── STANDINGS TAB ────────────────────────
     with tab_standings:
         standings = fetch_standings_fd()
         if not standings:
             st.info("Standings not available yet.")
         else:
-            # football-data returns one entry per group
             for group in standings:
                 group_name = group.get("group") or group.get("stage") or "Standings"
                 table      = group.get("table", [])
@@ -2038,11 +2117,12 @@ STAGE_ORDER = [
     ("group_round_1",  "Group Stage — Round 1",  "🌍"),
     ("group_round_2",  "Group Stage — Round 2",  "🌍"),
     ("group_round_3",  "Group Stage — Round 3",  "🌍"),
-    ("round_of_32",    "Round of 32",             "⚔️"),
-    ("round_of_16",    "Round of 16",             "⚔️"),
-    ("quarterfinal",   "Quarter Finals",          "🏅"),
-    ("semifinal",      "Semi Finals",             "🏅"),
-    ("final",          "Final",                   "🏆"),
+    ("round_of_32",    "Round of 32",            "⚔️"),
+    ("round_of_16",    "Round of 16",            "⚔️"),
+    ("quarterfinal",   "Quarter Finals",         "🏅"),
+    ("semifinal",      "Semi Finals",            "🏅"),
+    ("third_place",    "Third Place Play-off",   "🥉"),
+    ("final",          "Final",                  "🏆"),
 ]
 
 def predictions_page(user: dict, matches: list):
@@ -2054,9 +2134,6 @@ def predictions_page(user: dict, matches: list):
         st.info("No matches found. Check your API token or try again shortly.")
         return
 
-    # Build a lookup: stage_bucket -> list of ALL match IDs (for booster scoping)
-    # Explicitly cast to int to avoid sqlite3.InterfaceError from API returning
-    # IDs as floats, strings, or other unexpected types.
     bucket_ids: dict = {}
     for m in matches:
         b = stage_bucket(m)
@@ -2066,13 +2143,11 @@ def predictions_page(user: dict, matches: list):
             mid = str(m["id"])
         bucket_ids.setdefault(b, []).append(mid)
 
-    # Group every match by its stage bucket
     bucket_matches: dict = {}
     for m in matches:
         b = stage_bucket(m)
         bucket_matches.setdefault(b, []).append(m)
 
-    # Sort matches within each bucket chronologically
     for b in bucket_matches:
         bucket_matches[b].sort(key=lambda x: x["date"])
 
@@ -2092,8 +2167,10 @@ def predictions_page(user: dict, matches: list):
         if upcoming_in_section:
             with st.expander(f"📝 Upcoming ({len(upcoming_in_section)} match{'es' if len(upcoming_in_section)!=1 else ''})", expanded=True):
                 stage_ids = bucket_ids.get(bucket_key, [])
+                # Determine if this is a knockout stage
+                is_knockout_stage = bucket_key not in ("group_round_1", "group_round_2", "group_round_3")
                 for match in upcoming_in_section:
-                    _render_prediction_form(user, match, stage_ids)
+                    _render_prediction_form(user, match, stage_ids, is_knockout_stage)
 
         if finished_in_section:
             with st.expander(f"✅ Played ({len(finished_in_section)} match{'es' if len(finished_in_section)!=1 else ''})", expanded=False):
@@ -2105,13 +2182,14 @@ def predictions_page(user: dict, matches: list):
     if not any_section_shown:
         st.info("No matches found. Check your API token or try again shortly.")
 
-def _render_prediction_form(user: dict, match: dict, matchday_ids: list):
+def _render_prediction_form(user: dict, match: dict, matchday_ids: list, force_knockout: bool = False):
     match_id  = match["id"]
     home_team = match["home_team"]
     away_team = match["away_team"]
     kickoff   = parse_kickoff(match["date"])
     locked    = is_locked(kickoff)
-    is_ko     = match["stage"] not in GROUP_STAGES
+    # Use force_knockout flag or check stage
+    is_ko     = force_knockout or (match["stage"] not in GROUP_STAGES)
     saved     = get_prediction(user["id"], match_id)
 
     st.markdown(f"**{home_team} vs {away_team}**")
@@ -2170,7 +2248,7 @@ def _render_prediction_form(user: dict, match: dict, matchday_ids: list):
     first_scorer = None
     first_team   = None
     if is_ko:
-        st.caption("Knockout match — extra points for first scorer & first team.")
+        st.caption("⚡ Knockout match — extra points for first scorer & first team to score!")
         home_squad     = fetch_team_squad(match["home_team_id"])
         away_squad     = fetch_team_squad(match["away_team_id"])
         combined_squad = [""] + home_squad + away_squad
@@ -2211,7 +2289,6 @@ def _render_locked_match(user: dict, match: dict):
     saved     = get_prediction(user["id"], match_id)
     conn      = get_db()
 
-    # ── Match header ──────────────────────────────────────────────────────
     st.markdown(f"#### {home_team} vs {away_team}")
     st.caption(f"🕐 {display_time(kickoff)}")
 
@@ -2224,7 +2301,6 @@ def _render_locked_match(user: dict, match: dict):
     else:
         st.markdown("⏳ Locked — awaiting kick-off")
 
-    # ── Your prediction highlight ─────────────────────────────────────────
     if saved:
         booster_tag = " ⚡ 2x" if saved["booster_used"] else ""
         pts_tag     = f"  •  **{saved['points']} pts**" if saved.get("settled") else ""
@@ -2235,43 +2311,47 @@ def _render_locked_match(user: dict, match: dict):
     else:
         st.warning("You did not submit a prediction for this match.")
 
-    # ── Everyone's predictions table ──────────────────────────────────────
-    all_preds = conn.execute("""
-        SELECT u.name, p.home_goals, p.away_goals,
-               p.first_scorer, p.first_team,
-               p.booster_used, p.points, p.settled
-        FROM predictions p
-        JOIN users u ON u.id = p.user_id
-        WHERE p.match_id = ?
-        ORDER BY p.points DESC, u.name ASC
-    """, (str(match_id),)).fetchall()
+    # FIX: Only show other users' predictions after the match has FINISHED
+    # This prevents data leakage during live or locked-but-not-started matches
+    if match["status"] == "finished":
+        all_preds = conn.execute("""
+            SELECT u.name, p.home_goals, p.away_goals,
+                   p.first_scorer, p.first_team,
+                   p.booster_used, p.points, p.settled
+            FROM predictions p
+            JOIN users u ON u.id = p.user_id
+            WHERE p.match_id = ?
+            ORDER BY p.points DESC, u.name ASC
+        """, (str(match_id),)).fetchall()
 
-    if all_preds:
-        with st.expander(f"👥 See all predictions ({len(all_preds)} player{'s' if len(all_preds)!=1 else ''})", expanded=False):
-            rows = []
-            for p in all_preds:
-                name     = p["name"].title()
-                score    = f"{p['home_goals']} – {p['away_goals']}"
-                booster  = "⚡" if p["booster_used"] else ""
-                pts      = str(p["points"]) if p["settled"] else "–"
-                scorer   = p["first_scorer"] or "–"
-                team     = p["first_team"]   or "–"
-                # Highlight the current user's row
-                marker   = " 👈" if p["name"] == user["name"] else ""
-                rows.append({
-                    "Player":        name + marker,
-                    "Prediction":    score,
-                    "Booster":       booster,
-                    "First Scorer":  scorer,
-                    "First Team":    team,
-                    "Points":        pts,
-                })
-            import pandas as pd
-            df = pd.DataFrame(rows)
-            st.dataframe(df, use_container_width=True, hide_index=True)
+        if all_preds:
+            with st.expander(f"👥 See all predictions ({len(all_preds)} player{'s' if len(all_preds)!=1 else ''})", expanded=False):
+                rows = []
+                for p in all_preds:
+                    name     = p["name"].title()
+                    score    = f"{p['home_goals']} – {p['away_goals']}"
+                    booster  = "⚡" if p["booster_used"] else ""
+                    pts      = str(p["points"]) if p["settled"] else "–"
+                    scorer   = p["first_scorer"] or "–"
+                    team     = p["first_team"]   or "–"
+                    marker   = " 👈" if p["name"] == user["name"] else ""
+                    rows.append({
+                        "Player":        name + marker,
+                        "Prediction":    score,
+                        "Booster":       booster,
+                        "First Scorer":  scorer,
+                        "First Team":    team,
+                        "Points":        pts,
+                    })
+                import pandas as pd
+                df = pd.DataFrame(rows)
+                st.dataframe(df, use_container_width=True, hide_index=True)
+        else:
+            with st.expander("👥 Predictions"):
+                st.caption("No predictions submitted for this match.")
     else:
-        with st.expander("👥 Predictions"):
-            st.caption("No predictions submitted for this match.")
+        # Match is locked but not finished - don't show other predictions
+        st.caption("👥 Other players' predictions will be visible after the match finishes.")
 
     st.divider()
 
@@ -2280,6 +2360,7 @@ def _render_locked_match(user: dict, match: dict):
 # ─────────────────────────────────────────────
 def main():
     maybe_backup()
+    cleanup_expired_sessions()
 
     matches = fetch_matches_fd()
     if matches:
@@ -2291,6 +2372,18 @@ def main():
     if st.session_state.get("admin"):
         admin_page()
         return
+
+    # Check for persistent session
+    session_token = st.session_state.get("session_token")
+    user = None
+    if session_token:
+        user = get_user_from_session(session_token)
+        if user:
+            st.session_state["user"] = user
+        else:
+            # Session expired, clear it
+            st.session_state.pop("session_token", None)
+            st.session_state.pop("user", None)
 
     user = st.session_state.get("user")
     if not user:
@@ -2329,7 +2422,11 @@ def main():
         st.rerun()
 
     if st.sidebar.button("Log out"):
+        session_token = st.session_state.get("session_token")
+        if session_token:
+            delete_session(session_token)
         st.session_state.pop("user", None)
+        st.session_state.pop("session_token", None)
         st.session_state["page"] = "predictions"
         st.rerun()
 
@@ -2348,5 +2445,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-# ─────────────────────────────────────────────
