@@ -36,8 +36,13 @@ def stage_bucket(match: dict) -> str:
     Returns a string key identifying which booster bucket this match belongs to.
     Group-stage matches are split by matchday (1, 2, 3).
     Knockout rounds each get their own bucket.
+
+    Robust to whatever wording football-data.org uses (LAST_16, ROUND_OF_16,
+    QUARTER_FINALS, QUARTERFINAL, etc.) by matching on keywords/digits rather
+    than requiring an exact string match against a fixed dictionary.
     """
     stage = (match.get("stage") or "").lower().strip()
+
     if stage in GROUP_STAGES:
         md = str(match.get("matchday") or "").strip()
         if md in ("1", "2", "3"):
@@ -47,31 +52,26 @@ def stage_bucket(match: dict) -> str:
         if digits:
             return f"group_round_{digits[0]}"
         return "group_round_1"
-    stage_map = {
-        "round of 32":   "round_of_32",
-        "round_of_32":   "round_of_32",
-        "last 32":       "round_of_32",
-        "round of 16":   "round_of_16",
-        "round_of_16":   "round_of_16",
-        "last 16":       "round_of_16",
-        "quarter_final": "quarterfinal",
-        "quarter-final": "quarterfinal",
-        "quarterfinal":  "quarterfinal",
-        "quarter final": "quarterfinal",
-        "quarter-finals": "quarterfinal",
-        "quarter_finals": "quarterfinal",
-        "semi_final":    "semifinal",
-        "semi-final":    "semifinal",
-        "semifinal":     "semifinal",
-        "semi final":    "semifinal",
-        "semi-finals":   "semifinal",
-        "semi_finals":   "semifinal",
-        "third_place":   "third_place",
-        "third place":   "third_place",
-        "3rd place":     "third_place",
-        "final":         "final",
-    }
-    return stage_map.get(stage, stage)
+
+    # Normalise punctuation so "quarter-finals", "quarter_finals",
+    # "quarter finals" and "quarterfinal" all collapse to one comparable form.
+    flat = stage.replace("-", " ").replace("_", " ")
+    flat = " ".join(flat.split())
+
+    if "third" in flat or "3rd" in flat:
+        return "third_place"
+    if "final" in flat:
+        if "quarter" in flat:
+            return "quarterfinal"
+        if "semi" in flat:
+            return "semifinal"
+        return "final"  # bare "final" = the Final itself
+    if "32" in flat:
+        return "round_of_32"
+    if "16" in flat:
+        return "round_of_16"
+
+    return flat.replace(" ", "_") or "unknown"
 
 st.set_page_config(
     page_title="World Cup 2026 Predictor",
